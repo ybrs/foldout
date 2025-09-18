@@ -78,8 +78,11 @@ fn vkar_hash_table(reg: pg_sys::Oid, batch_rows: i32) -> String {
             };
 
             // Build the base query and open a SPI cursor (Portal) using the C API
+            // Use `select *` to get each column. We'll encode each value using
+            // its text output (fast path via SPI_getvalue) which avoids JSONB
+            // overhead and still performs well.
             let select_sql = format!(
-                "select to_jsonb(t) from \"{}\".\"{}\" t",
+                "select * from \"{}\".\"{}\"",
                 nsp.replace('"', "\"\""),
                 rel.replace('"', "\"\"")
             );
@@ -109,6 +112,7 @@ fn vkar_hash_table(reg: pg_sys::Oid, batch_rows: i32) -> String {
 
             // Fetch in batches via SPI_cursor_fetch to avoid SQL-level FETCH inside a function
             let batch = if batch_rows > 0 { batch_rows as isize } else { 10000 as isize };
+            let mut numcols: i32 = 0;
             loop {
                 pg_sys::SPI_cursor_fetch(portal, true, batch as _);
                 if pg_sys::SPI_processed == 0 { break; }
@@ -119,26 +123,44 @@ fn vkar_hash_table(reg: pg_sys::Oid, batch_rows: i32) -> String {
                 }
                 let tupdesc = (*tt).tupdesc;
                 let vals = (*tt).vals;
+                if numcols == 0 { numcols = unsafe { (*tupdesc).natts } as i32; }
                 for i in 0..pg_sys::SPI_processed {
                     let htup = *vals.add(i as usize);
-                    let mut isnull = false;
-                    let datum = pg_sys::SPI_getbinval(htup, tupdesc, 1, &mut isnull);
-                    if isnull { continue; }
-                    let jb = match pgrx::datum::JsonB::from_datum(datum, false) {
-                        Some(j) => j,
-                        None => {
-                            pgrx::warning!("pg_hashdb: failed to decode jsonb row");
-                            continue;
-                        }
-                    };
-                    let bytes = jb.0.to_string();
+                    // Hash a canonical per-column text representation
                     let mut row = Hasher::new();
-                    row.update(bytes.as_bytes());
+                    let mut row_keyed = Hasher::new_keyed(&KEY);
+                    // Include number of columns to delimit structure
+                    row.update(&(numcols as i32).to_be_bytes());
+                    row_keyed.update(&(numcols as i32).to_be_bytes());
+                    let mut col: i32 = 1;
+                    while col <= numcols {
+                        let mut isnull = false;
+                        let val = unsafe { pg_sys::SPI_getbinval(htup, tupdesc, col, &mut isnull) };
+                        if isnull {
+                            // Length = -1 marks NULL (mirrors COPY BINARY conventions)
+                            row.update(&(-1i32).to_be_bytes());
+                            row_keyed.update(&(-1i32).to_be_bytes());
+                        } else {
+                            // Use text output for this column via SPI_getvalue
+                            let cstr = unsafe { pg_sys::SPI_getvalue(htup, tupdesc, col) };
+                            if cstr.is_null() {
+                                row.update(&(0i32).to_be_bytes());
+                                row_keyed.update(&(0i32).to_be_bytes());
+                            } else {
+                                let bytes = unsafe { std::ffi::CStr::from_ptr(cstr) };
+                                let blen = bytes.to_bytes().len() as i32;
+                                row.update(&blen.to_be_bytes());
+                                row_keyed.update(&blen.to_be_bytes());
+                                row.update(bytes.to_bytes());
+                                row_keyed.update(bytes.to_bytes());
+                                unsafe { pg_sys::pfree(cstr as *mut _); }
+                            }
+                        }
+                        col += 1;
+                    }
                     let r = row.finalize();
                     let h1 = u128::from_be_bytes(r.as_bytes()[..16].try_into().unwrap());
-                    let mut row2 = Hasher::new_keyed(&KEY);
-                    row2.update(bytes.as_bytes());
-                    let r2 = row2.finalize();
+                    let r2 = row_keyed.finalize();
                     let h2 = u128::from_be_bytes(r2.as_bytes()[..16].try_into().unwrap());
                     s1 = s1.wrapping_add(h1);
                     s2 = s2.wrapping_add(h2);
