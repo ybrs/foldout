@@ -133,6 +133,19 @@ fn partition_round_robin<T: Clone>(v: &[T], k: usize) -> Vec<Vec<T>> {
     parts
 }
 
+fn partition_lpt(v: &[(String,String,i64,i64)], k: usize) -> Vec<Vec<(String,String,i64,i64)>> {
+    let mut sorted: Vec<_> = v.to_vec();
+    sorted.sort_by_key(|t| std::cmp::Reverse(t.3.max(0)));
+    let mut parts: Vec<Vec<(String,String,i64,i64)>> = vec![Vec::new(); k];
+    let mut loads: Vec<i64> = vec![0; k];
+    for item in sorted {
+        let (idx, _) = loads.iter().enumerate().min_by_key(|(_,l)| *l).unwrap();
+        loads[idx] += item.3.max(0);
+        parts[idx].push(item);
+    }
+    parts
+}
+
 fn main() {
     if let Ok(t) = env::var("VKA_HASH_THREADS") {
         if let Ok(n) = t.parse::<usize>() {
@@ -170,7 +183,8 @@ fn main() {
     drop(client);
 
     let k = if workers == 0 { 1 } else { workers };
-    let parts = partition_round_robin(&tables, k);
+    let use_lpt = env::var("VKA_HASH_LPT").ok().map(|s| s != "0").unwrap_or(true);
+    let parts = if use_lpt { partition_lpt(&tables, k) } else { partition_round_robin(&tables, k) };
     let start = Instant::now();
 
     let mut handles = Vec::new();
