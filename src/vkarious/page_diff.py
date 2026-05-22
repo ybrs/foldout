@@ -92,6 +92,7 @@ def dump_schema(conn):
         "views": {},         # 'nsp.name' -> definition (SELECT body)
         "matviews": {},      # 'nsp.name' -> definition
         "functions": {},     # 'nsp.name(args)' -> full CREATE FUNCTION text
+        "sequences": {},     # 'nsp.name' -> seq params + last_value + owned_by
     }
 
     with conn.cursor() as cur:
@@ -231,6 +232,49 @@ def dump_schema(conn):
                 "definition": fdef.rstrip(),
             }
 
+        # Sequences (incl. those auto-created for SERIAL columns).
+        # pg_sequence_last_value returns NULL if the sequence has never
+        # been called yet. We record the OWNED BY target (schema.tbl.col)
+        # so we can emit `ALTER SEQUENCE ... OWNED BY ...` after the table
+        # is created.
+        cur.execute(f"""
+            SELECT n.nspname, c.relname,
+                   format_type(s.seqtypid, NULL) AS data_type,
+                   s.seqstart, s.seqincrement, s.seqmin, s.seqmax,
+                   s.seqcache, s.seqcycle,
+                   pg_sequence_last_value(c.oid::regclass) AS last_value,
+                   (
+                     SELECT n2.nspname || '.' || c2.relname || '.' || a.attname
+                     FROM pg_depend d
+                     JOIN pg_class c2 ON c2.oid = d.refobjid
+                     JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                     JOIN pg_attribute a ON a.attrelid = d.refobjid
+                                        AND a.attnum = d.refobjsubid
+                     WHERE d.classid = 'pg_class'::regclass
+                       AND d.refclassid = 'pg_class'::regclass
+                       AND d.objid = c.oid
+                       AND d.deptype IN ('a','i')
+                     LIMIT 1
+                   ) AS owned_by
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_sequence s ON s.seqrelid = c.oid
+            WHERE c.relkind = 'S'
+              AND n.nspname NOT IN {EXCLUDED_SCHEMAS_SQL}
+              AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+        """)
+        for (nsp, name, dtype, start, inc, mn, mx,
+             cache, cycle, last_value, owned_by) in cur.fetchall():
+            out["sequences"][f"{nsp}.{name}"] = {
+                "schema": nsp, "name": name,
+                "data_type": dtype,
+                "start": int(start), "increment": int(inc),
+                "min": int(mn), "max": int(mx),
+                "cache": int(cache), "cycle": bool(cycle),
+                "last_value": (int(last_value) if last_value is not None else None),
+                "owned_by": owned_by,
+            }
+
     return out
 
 
@@ -288,6 +332,23 @@ def diff_schemas(src, tgt):
     tgt_schemas = set(tgt["schemas"])
     for s in sorted(tgt_schemas - src_schemas):
         pre.append(f'CREATE SCHEMA {_q(s)};')
+
+    # Sequences (CREATE before tables so DEFAULT nextval('seq') resolves)
+    src_seqs = src.get("sequences", {})
+    tgt_seqs = tgt.get("sequences", {})
+    new_seq_keys = sorted(set(tgt_seqs) - set(src_seqs))
+    dropped_seq_keys = sorted(set(src_seqs) - set(tgt_seqs))
+    for k in new_seq_keys:
+        s = tgt_seqs[k]
+        pre.append(
+            f'CREATE SEQUENCE {_q(s["schema"])}.{_q(s["name"])} '
+            f'AS {s["data_type"]} '
+            f'START WITH {s["start"]} INCREMENT BY {s["increment"]} '
+            f'MINVALUE {s["min"]} MAXVALUE {s["max"]} '
+            f'CACHE {s["cache"]}'
+            + (' CYCLE' if s["cycle"] else '')
+            + ';'
+        )
 
     # Tables
     src_tabs = src["tables"]
@@ -420,10 +481,59 @@ def diff_schemas(src, tgt):
             # CREATE OR REPLACE FUNCTION is included in pg_get_functiondef
             pre.append(tgt["functions"][k]["definition"] + ";")
 
+    # Sequence ownership: attach new sequences to their column AFTER the
+    # CREATE TABLE so the owning column exists.
+    for k in new_seq_keys:
+        s = tgt_seqs[k]
+        if s.get("owned_by"):
+            ob = s["owned_by"]  # 'nsp.tbl.col'
+            try:
+                nsp_o, rest = ob.split(".", 1)
+                tbl_o, col_o = rest.split(".", 1)
+            except ValueError:
+                continue
+            pre.append(
+                f'ALTER SEQUENCE {_q(s["schema"])}.{_q(s["name"])} '
+                f'OWNED BY {_q(nsp_o)}.{_q(tbl_o)}.{_q(col_o)};'
+            )
+
     # Drop tables and schemas last
     for k in dropped_tabs:
         t = src_tabs[k]
         post.append(f'DROP TABLE {_q(t["schema"])}.{_q(t["name"])};')
+
+    # Setval — align sequence position on source to match target. We do
+    # this for every target sequence whose last_value differs from source's
+    # (or which is new). DML INSERTs with explicit IDs do NOT advance the
+    # sequence, so without this, source's seq would still be at its old
+    # value and the next nextval() would collide with rows we just inserted.
+    for k in sorted(tgt_seqs):
+        s = tgt_seqs[k]
+        prev = src_seqs.get(k)
+        if (prev is not None
+                and prev.get("last_value") == s.get("last_value")):
+            continue
+        if s.get("last_value") is None:
+            # Sequence never called yet on target. setval(start_val, false)
+            # so the next nextval() returns start.
+            post.append(
+                f"SELECT setval('{s['schema']}.{s['name']}', "
+                f"{s['start']}, false);"
+            )
+        else:
+            post.append(
+                f"SELECT setval('{s['schema']}.{s['name']}', "
+                f"{s['last_value']}, true);"
+            )
+
+    # Drop sequences that aren't owned by a dropped table (those auto-drop
+    # via OWNED BY). For simplicity emit IF EXISTS so we tolerate the cascade.
+    for k in dropped_seq_keys:
+        s = src_seqs[k]
+        post.append(
+            f'DROP SEQUENCE IF EXISTS {_q(s["schema"])}.{_q(s["name"])};'
+        )
+
     for s in sorted(src_schemas - tgt_schemas):
         post.append(f'DROP SCHEMA {_q(s)};')
 

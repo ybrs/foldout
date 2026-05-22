@@ -443,6 +443,30 @@ SCENARIOS = [
         expected_counts={"DDL_PRE": 1},
     ),
     Scenario(
+        name="ddl-create-table-with-serial",
+        setup_sql=[
+            "CREATE TABLE other (id int primary key)",
+            "INSERT INTO other VALUES (1)",
+        ],
+        mutate_sql=[
+            "CREATE TABLE evt (id serial primary key, msg text)",
+            "INSERT INTO evt(msg) VALUES ('first'),('second'),('third')",
+        ],
+        expected_counts={"INSERT": 3},
+    ),
+    Scenario(
+        name="ddl-sequence-only-advanced",
+        setup_sql=[
+            "CREATE TABLE log (id serial primary key, msg text)",
+            "INSERT INTO log(msg) VALUES ('a'),('b')",
+        ],
+        mutate_sql=[
+            # Advance the sequence further on branch via more INSERTs.
+            "INSERT INTO log(msg) VALUES ('c'),('d'),('e')",
+        ],
+        expected_counts={"INSERT": 3},
+    ),
+    Scenario(
         name="ddl-add-column-jsonb-default",
         setup_sql=[
             "CREATE TABLE u (id int primary key, name text)",
