@@ -15,6 +15,8 @@ from .db import (
     database_write_lock,
     delete_database_record,
     drop_database,
+    get_branch_parent,
+    get_branch_snapshot_path,
     get_data_directory,
     get_database_oid,
     get_databases_with_snapshots,
@@ -28,6 +30,7 @@ from .db import (
     restore_database_from_snapshot,
 )
 from .change_capture import ChangeCaptureInstaller
+from . import page_diff
 
 
 def run_command(command: list[str]) -> None:
@@ -94,7 +97,13 @@ def branch(database_name: str, branch_name: str) -> None:
         # Log branch creation operation
         log_branch_operation(source_oid, target_oid, branch_database_name)
         click.echo(f"Logged branch creation operation to vka_log")
-        
+
+        # Take a page-diff snapshot of the branch so `vka diff <branch>`
+        # can later report row-level changes against the parent.
+        snap_path = get_branch_snapshot_path(target_oid)
+        page_diff.snapshot(data_directory, branch_database_name, str(snap_path))
+        click.echo(f"Saved page-diff snapshot: {snap_path}")
+
         click.echo(f"Branch completed successfully: {branch_database_name}")
         
     except Exception as e:
@@ -268,6 +277,64 @@ def list_databases_cmd() -> None:
         click.echo("-" * 30)
         for db in dbs:
             click.echo(f"{db['oid']:<10} {db['name']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.argument("branch_name")
+@click.option("--apply", is_flag=True,
+              help="Apply the generated SQL to the parent database "
+                   "(default: print SQL only).")
+@click.option("--sql-only", is_flag=True,
+              help="Print only the SQL statements, no summary.")
+def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
+    """Show row-level changes on BRANCH_NAME relative to its parent.
+
+    Uses the page-diff snapshot taken at branch time to identify exactly
+    which pages changed, then emits INSERT/UPDATE/DELETE SQL.
+    """
+    try:
+        branch_oid, parent_oid, parent_name = get_branch_parent(branch_name)
+        snap_path = get_branch_snapshot_path(branch_oid)
+        if not snap_path.exists():
+            raise click.ClickException(
+                f"No page-diff snapshot for branch '{branch_name}' at {snap_path}. "
+                f"It must have been created by `vka branch` after this feature was added."
+            )
+
+        data_directory = get_data_directory()
+        if not sql_only:
+            click.echo(f"Diffing branch '{branch_name}' against parent '{parent_name}'")
+            click.echo(f"  snapshot: {snap_path}")
+            click.echo(f"  pgdata:   {data_directory}")
+            click.echo()
+
+        result = page_diff.cross_diff(
+            data_directory, parent_name, branch_name, str(snap_path),
+            verbose=not sql_only,
+        )
+
+        if sql_only:
+            for s in result["sql"]:
+                click.echo(s)
+
+        if apply and result["sql"]:
+            click.echo()
+            click.echo(f"Applying {len(result['sql'])} statements to '{parent_name}'...")
+            import psycopg
+            from .db import get_database_dsn
+            dsn = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+            dsn["dbname"] = parent_name
+            target_dsn = psycopg.conninfo.make_conninfo(**dsn)
+            with psycopg.connect(target_dsn) as conn:
+                with conn.cursor() as cur:
+                    for s in result["sql"]:
+                        cur.execute(s)
+                conn.commit()
+            click.echo("Applied. Parent now contains branch's data changes.")
+
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         raise click.ClickException(str(e))

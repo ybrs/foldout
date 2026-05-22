@@ -69,6 +69,40 @@ def get_database_oid(database_name: str) -> int:
             return result[0]
 
 
+def get_branch_parent(branch_name: str) -> tuple[int, int, str]:
+    """Look up branch in vka_databases and return (branch_oid, parent_oid, parent_datname)."""
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params['dbname'] = "vkarious"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT vd.oid, vd.parent, pg.datname
+                FROM vka_databases vd
+                JOIN pg_database pg ON pg.oid = vd.parent
+                WHERE vd.datname = %s AND vd.type = 'branch'
+            """, (branch_name,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(
+                    f"Branch '{branch_name}' not found in vka_databases "
+                    f"(or its parent no longer exists)"
+                )
+            return row[0], row[1], row[2]
+
+
+def get_snapshot_dir() -> Path:
+    """Directory where page-diff snapshots for branches live."""
+    base = Path(os.path.expanduser("~/.vkarious/snapshots"))
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def get_branch_snapshot_path(branch_oid: int) -> Path:
+    return get_snapshot_dir() / f"{branch_oid}.json"
+
+
 def terminate_database_connections(database_name: str) -> int:
     """Terminate all connections to a database except the current one."""
     with connect() as conn:

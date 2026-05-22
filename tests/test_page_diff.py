@@ -28,10 +28,9 @@ from pathlib import Path
 
 import psycopg
 
-# Make page_diff_v2 importable from the repo root
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-import page_diff_v2  # noqa: E402
+sys.path.insert(0, str(ROOT / "src"))
+from vkarious import page_diff as page_diff_v2  # noqa: E402
 
 USER = os.environ.get("USER", "aybarsb")
 HOST = "127.0.0.1"
@@ -149,11 +148,13 @@ def _apply_sql(db, sql_statements):
 class Scenario:
     """One end-to-end test case."""
 
-    def __init__(self, name, setup_sql, mutate_sql, expected_counts=None):
+    def __init__(self, name, setup_sql, mutate_sql, expected_counts=None,
+                 skip_post_checkpoint=False):
         self.name = name
         self.setup_sql = setup_sql
         self.mutate_sql = mutate_sql
         self.expected = expected_counts  # dict like {"INSERT": 2, ...} or None
+        self.skip_post_checkpoint = skip_post_checkpoint
 
     def run(self):
         suffix = uuid.uuid4().hex[:8]
@@ -174,7 +175,8 @@ class Scenario:
             page_diff_v2.snapshot(PGDATA, tgt, snap_path)
 
             _exec_many(tgt, self.mutate_sql)
-            _checkpoint(tgt)
+            if not getattr(self, "skip_post_checkpoint", False):
+                _checkpoint(tgt)
 
             result = page_diff_v2.cross_diff(PGDATA, src, tgt, snap_path, verbose=False)
             sql = result["sql"]
@@ -294,6 +296,179 @@ SCENARIOS = [
             "INSERT INTO q VALUES (4, NULL, 'has null name')",
         ],
         expected_counts={"INSERT": 1, "UPDATE": 2, "DELETE": 0},
+    ),
+    Scenario(
+        name="no-pk-basic-insert-delete",
+        setup_sql=[
+            "CREATE TABLE np (v text, n int)",
+            "INSERT INTO np SELECT 'a'||g, g FROM generate_series(1,100) g",
+        ],
+        mutate_sql=[
+            "INSERT INTO np VALUES ('zzz', 9999)",
+            "DELETE FROM np WHERE n = 42",
+        ],
+        expected_counts={"INSERT": 1, "DELETE": 1},
+    ),
+    Scenario(
+        name="no-pk-update-becomes-insert-plus-delete",
+        setup_sql=[
+            "CREATE TABLE np (v text, n int)",
+            "INSERT INTO np SELECT 'r'||g, g FROM generate_series(1,50) g",
+        ],
+        mutate_sql=[
+            # UPDATE on no-PK table: shows up as INSERT(new) + DELETE(old)
+            "UPDATE np SET v='CHANGED' WHERE n = 10",
+        ],
+        expected_counts={"INSERT": 1, "DELETE": 1, "UPDATE": 0},
+    ),
+    Scenario(
+        name="no-pk-with-duplicate-rows",
+        setup_sql=[
+            "CREATE TABLE np (v text, n int)",
+            "INSERT INTO np VALUES ('dup',1),('dup',1),('dup',1),('uniq',2)",
+        ],
+        mutate_sql=[
+            # delete one of three 'dup' rows; should produce one DELETE
+            "DELETE FROM np WHERE ctid = (SELECT ctid FROM np WHERE v='dup' LIMIT 1)",
+            # add a new duplicate
+            "INSERT INTO np VALUES ('uniq',2)",
+        ],
+        expected_counts={"INSERT": 1, "DELETE": 1, "UPDATE": 0},
+    ),
+    Scenario(
+        name="diff-without-manual-checkpoint",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+            "INSERT INTO u SELECT g, 'u-'||g FROM generate_series(1,200) g",
+        ],
+        mutate_sql=[
+            "INSERT INTO u VALUES (999, 'nochk')",
+            "DELETE FROM u WHERE id = 50",
+        ],
+        expected_counts={"INSERT": 1, "UPDATE": 0, "DELETE": 1},
+        skip_post_checkpoint=True,  # critical: regression for forgotten flush
+    ),
+    # ---- DDL ----
+    Scenario(
+        name="ddl-create-table",
+        setup_sql=[
+            "CREATE TABLE existing (id int primary key, v text)",
+            "INSERT INTO existing VALUES (1,'a'),(2,'b')",
+        ],
+        mutate_sql=[
+            "CREATE TABLE newt (id int primary key, name text not null)",
+            "INSERT INTO newt VALUES (10,'x')",
+        ],
+        expected_counts={"DDL_PRE": 1, "INSERT": 1},
+    ),
+    Scenario(
+        name="ddl-drop-table",
+        setup_sql=[
+            "CREATE TABLE t1 (id int primary key)",
+            "CREATE TABLE t2 (id int primary key)",
+        ],
+        mutate_sql=[
+            "DROP TABLE t1",
+        ],
+        expected_counts={"DDL_POST": 1},
+    ),
+    Scenario(
+        name="ddl-add-column",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+            "INSERT INTO u VALUES (1,'a'),(2,'b')",
+        ],
+        mutate_sql=[
+            "ALTER TABLE u ADD COLUMN extra int DEFAULT 0 NOT NULL",
+            "UPDATE u SET extra = 99 WHERE id = 1",
+        ],
+        expected_counts={"DDL_PRE": 1, "UPDATE": 1},
+    ),
+    Scenario(
+        name="ddl-drop-column",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text, doomed int)",
+            "INSERT INTO u VALUES (1,'a',5),(2,'b',7)",
+        ],
+        mutate_sql=[
+            "ALTER TABLE u DROP COLUMN doomed",
+        ],
+        expected_counts={"DDL_PRE": 1},
+    ),
+    Scenario(
+        name="ddl-add-index",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+            "INSERT INTO u VALUES (1,'a'),(2,'b')",
+        ],
+        mutate_sql=[
+            "CREATE INDEX u_name_idx ON u(name)",
+        ],
+        expected_counts={"DDL_PRE": 1},
+    ),
+    Scenario(
+        name="ddl-foreign-key",
+        setup_sql=[
+            "CREATE TABLE parent (id int primary key)",
+            "CREATE TABLE child (id int primary key, parent_id int)",
+            "INSERT INTO parent VALUES (1),(2)",
+        ],
+        mutate_sql=[
+            "ALTER TABLE child ADD CONSTRAINT child_parent_fk "
+            "FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE CASCADE",
+            "INSERT INTO child VALUES (10, 1)",
+        ],
+        expected_counts={"DDL_PRE": 1, "INSERT": 1},
+    ),
+    Scenario(
+        name="ddl-create-view",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text, age int)",
+            "INSERT INTO u VALUES (1,'a',20),(2,'b',30)",
+        ],
+        mutate_sql=[
+            "CREATE VIEW adults AS SELECT id, name FROM u WHERE age >= 18",
+        ],
+        expected_counts={"DDL_PRE": 1},
+    ),
+    Scenario(
+        name="ddl-create-function",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+        ],
+        mutate_sql=[
+            "CREATE FUNCTION greet(n text) RETURNS text "
+            "LANGUAGE sql AS $$ SELECT 'hello, '||n $$",
+        ],
+        expected_counts={"DDL_PRE": 1},
+    ),
+    Scenario(
+        name="ddl-add-column-jsonb-default",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+            "INSERT INTO u VALUES (1,'a'),(2,'b'),(3,'c')",
+        ],
+        mutate_sql=[
+            # jsonb default — Python couldn't sensibly parse this; Postgres can.
+            "ALTER TABLE u ADD COLUMN meta jsonb NOT NULL DEFAULT '{\"v\":0}'::jsonb",
+            "UPDATE u SET meta = '{\"v\":42}'::jsonb WHERE id = 2",
+        ],
+        # Only id=2 should generate UPDATE; id=1 and id=3 keep the default
+        expected_counts={"DDL_PRE": 1, "INSERT": 0, "UPDATE": 1, "DELETE": 0},
+    ),
+    Scenario(
+        name="ddl-and-dml-combined",
+        setup_sql=[
+            "CREATE TABLE u (id int primary key, name text)",
+            "INSERT INTO u VALUES (1,'a')",
+        ],
+        mutate_sql=[
+            "ALTER TABLE u ADD COLUMN score int",
+            "INSERT INTO u VALUES (2,'b',100)",
+            "UPDATE u SET score = 50 WHERE id = 1",
+            "CREATE INDEX u_score_idx ON u(score)",
+        ],
+        expected_counts={"DDL_PRE": 2, "INSERT": 1, "UPDATE": 1},
     ),
     Scenario(
         name="toasted-large-value",
