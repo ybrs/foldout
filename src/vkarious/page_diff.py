@@ -540,6 +540,212 @@ def diff_schemas(src, tgt):
     return pre, post
 
 
+def _merge_table_3way(base_t, main_t, branch_t, table_key, conflicts, drifts=None):
+    """3-way merge a single table dict (column-level + PK). Mutates `conflicts`
+    when both sides changed the same thing differently; appends to `drifts`
+    (if provided) for column-level changes parent made independently.
+    Returns the merged table state, taking main as the starting point and
+    applying branch's safe additions/modifications.
+    """
+    base_cols = {c["name"]: c for c in base_t["columns"]} if base_t else {}
+    main_cols = {c["name"]: c for c in main_t["columns"]} if main_t else {}
+    branch_cols = {c["name"]: c for c in branch_t["columns"]} if branch_t else {}
+    all_col_names = set(base_cols) | set(main_cols) | set(branch_cols)
+
+    merged_cols_by_name = dict(main_cols)
+    for cn in all_col_names:
+        bc = base_cols.get(cn)
+        mc = main_cols.get(cn)
+        rc = branch_cols.get(cn)
+        branch_changed = (bc != rc)
+        main_changed = (bc != mc)
+        if branch_changed and main_changed:
+            if rc == mc:
+                continue  # same change applied both sides
+            conflicts.append({
+                "kind": "column", "key": f"{table_key}.{cn}",
+                "base": bc, "main": mc, "branch": rc,
+            })
+        elif branch_changed and not main_changed:
+            if rc is None:
+                merged_cols_by_name.pop(cn, None)
+            else:
+                merged_cols_by_name[cn] = rc
+        elif main_changed and not branch_changed:
+            # Parent independently changed this column. Record as drift so
+            # the user knows; merged keeps main's state (default behavior).
+            if drifts is not None:
+                drifts.append({
+                    "kind": "column", "key": f"{table_key}.{cn}",
+                    "base": bc, "main": mc,
+                })
+
+    # Order: keep main's original order, then append columns branch added that
+    # weren't in base or main.
+    merged_columns = [
+        merged_cols_by_name[c["name"]]
+        for c in (main_t["columns"] if main_t else [])
+        if c["name"] in merged_cols_by_name
+    ]
+    seen = {c["name"] for c in merged_columns}
+    for cn in branch_cols:
+        if cn in seen:
+            continue
+        if cn not in main_cols and cn not in base_cols:
+            merged_columns.append(branch_cols[cn])
+            seen.add(cn)
+
+    # PK 3-way
+    base_pk = base_t.get("primary_key") if base_t else None
+    main_pk = main_t.get("primary_key") if main_t else None
+    branch_pk = branch_t.get("primary_key") if branch_t else None
+    branch_pk_changed = base_pk != branch_pk
+    main_pk_changed = base_pk != main_pk
+    if branch_pk_changed and main_pk_changed and branch_pk != main_pk:
+        conflicts.append({
+            "kind": "primary_key", "key": table_key,
+            "base": base_pk, "main": main_pk, "branch": branch_pk,
+        })
+        merged_pk = main_pk
+    elif branch_pk_changed:
+        merged_pk = branch_pk
+    else:
+        merged_pk = main_pk
+
+    merged = dict(main_t) if main_t else dict(branch_t)
+    merged["columns"] = merged_columns
+    merged["primary_key"] = merged_pk
+    return merged
+
+
+def _three_way_dict_merge(base_d, main_d, branch_d, kind, conflicts):
+    """3-way merge a `{key: state_dict}` mapping (indexes, constraints, views,
+    matviews, functions, sequences). Object-level: if both sides changed the
+    same key differently, record a conflict and keep main's state.
+    """
+    merged = dict(main_d)
+    all_keys = set(base_d) | set(main_d) | set(branch_d)
+    for k in all_keys:
+        b = base_d.get(k)
+        m = main_d.get(k)
+        r = branch_d.get(k)
+        branch_changed = (b != r)
+        main_changed = (b != m)
+        if branch_changed and main_changed:
+            if r == m:
+                continue
+            conflicts.append({"kind": kind, "key": k, "base": b, "main": m, "branch": r})
+        elif branch_changed and not main_changed:
+            if r is None:
+                merged.pop(k, None)
+            else:
+                merged[k] = r
+    return merged
+
+
+def merge_schemas_3way(base, main, branch):
+    """Build merged_schema = main + branch's safe intent. Returns
+    (merged_schema, conflicts, drifts) where:
+      - merged_schema: target state to apply to main
+      - conflicts: list of dicts describing what couldn't be merged
+      - drifts: list of dicts describing what main changed independently
+    """
+    conflicts = []
+    drifts = []
+
+    # Schemas (namespaces)
+    base_ns = set(base["schemas"])
+    main_ns = set(main["schemas"])
+    branch_ns = set(branch["schemas"])
+    merged_ns = set(main_ns)
+    for n in base_ns | main_ns | branch_ns:
+        b = n in base_ns
+        m = n in main_ns
+        r = n in branch_ns
+        if (b != r) and (b != m):
+            if r == m:
+                continue
+            conflicts.append({"kind": "schema", "key": n, "base": b, "main": m, "branch": r})
+        elif (b != r) and (b == m):
+            if r:
+                merged_ns.add(n)
+            else:
+                merged_ns.discard(n)
+        elif (b != m) and (b == r):
+            drifts.append({"kind": "schema", "key": n, "main": m, "base": b})
+
+    # Tables — column-level 3-way for tables present in all three; object-level
+    # for additions/deletions.
+    base_t = base["tables"]; main_t = main["tables"]; branch_t = branch["tables"]
+    merged_tables = dict(main_t)
+    all_tab_keys = set(base_t) | set(main_t) | set(branch_t)
+    for k in all_tab_keys:
+        b = base_t.get(k); m = main_t.get(k); r = branch_t.get(k)
+        branch_changed = (b != r)
+        main_changed = (b != m)
+        if not branch_changed and not main_changed:
+            continue
+        if branch_changed and not main_changed:
+            if r is None:
+                merged_tables.pop(k, None)
+            elif b is None:
+                merged_tables[k] = r
+            else:
+                # both have base AND branch; column-level merge against main
+                merged_tables[k] = _merge_table_3way(b, m, r, k, conflicts, drifts)
+        elif main_changed and not branch_changed:
+            drifts.append({"kind": "table", "key": k, "main": m, "base": b})
+        else:  # both changed
+            if r == m:
+                continue
+            if b is not None and m is not None and r is not None:
+                merged_tables[k] = _merge_table_3way(b, m, r, k, conflicts, drifts)
+            else:
+                conflicts.append({"kind": "table", "key": k, "base": b, "main": m, "branch": r})
+
+    merged_indexes = _three_way_dict_merge(base["indexes"], main["indexes"], branch["indexes"], "index", conflicts)
+    merged_constr  = _three_way_dict_merge(base["constraints"], main["constraints"], branch["constraints"], "constraint", conflicts)
+    merged_views   = _three_way_dict_merge(base["views"], main["views"], branch["views"], "view", conflicts)
+    merged_matv    = _three_way_dict_merge(base["matviews"], main["matviews"], branch["matviews"], "matview", conflicts)
+    merged_funcs   = _three_way_dict_merge(base["functions"], main["functions"], branch["functions"], "function", conflicts)
+    merged_seqs    = _three_way_dict_merge(base["sequences"], main["sequences"], branch["sequences"], "sequence", conflicts)
+
+    # Track drifts in non-table object kinds too (informational)
+    for kind, base_d, main_d, branch_d in [
+        ("index", base["indexes"], main["indexes"], branch["indexes"]),
+        ("constraint", base["constraints"], main["constraints"], branch["constraints"]),
+        ("view", base["views"], main["views"], branch["views"]),
+        ("matview", base["matviews"], main["matviews"], branch["matviews"]),
+        ("function", base["functions"], main["functions"], branch["functions"]),
+        ("sequence", base["sequences"], main["sequences"], branch["sequences"]),
+    ]:
+        for k in set(base_d) | set(main_d) | set(branch_d):
+            if base_d.get(k) != main_d.get(k) and base_d.get(k) == branch_d.get(k):
+                drifts.append({"kind": kind, "key": k, "main": main_d.get(k), "base": base_d.get(k)})
+
+    merged = {
+        "schemas": sorted(merged_ns),
+        "tables": merged_tables,
+        "indexes": merged_indexes,
+        "constraints": merged_constr,
+        "views": merged_views,
+        "matviews": merged_matv,
+        "functions": merged_funcs,
+        "sequences": merged_seqs,
+    }
+    return merged, conflicts, drifts
+
+
+def diff_schemas_3way(base, main, branch):
+    """Return (pre_dml, post_dml, conflicts, drifts). The pre/post lists are
+    SQL statements to make `main` look like the merged state (main + branch's
+    intent, excluding conflicts).
+    """
+    merged, conflicts, drifts = merge_schemas_3way(base, main, branch)
+    pre, post = diff_schemas(main, merged)
+    return pre, post, conflicts, drifts
+
+
 def list_relations(conn):
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -838,6 +1044,28 @@ def diff(pgdata, dbname, snap_path, *, verbose=False):
 
 # ---------- cross-DB diff (source vs current) ----------
 
+def find_changed_blocks_lsn_only(pgdata, relpath, snap_lsn):
+    """Like find_changed_blocks_per_relation but with no stat-skip layer:
+    scan every segment for pages with pd_lsn > snap_lsn. Used for the
+    "main" (parent) side of a 3-way diff, where we don't carry a per-file
+    snapshot but still need to know which pages drifted after branch time.
+    """
+    out = []
+    bytes_scanned = 0
+    for seg_idx, seg_full in segment_paths(pgdata, relpath):
+        rel_seg_path = os.path.relpath(seg_full, pgdata)
+        try:
+            bytes_scanned += os.path.getsize(seg_full)
+        except OSError:
+            continue
+        out.extend(
+            scan_segment_for_changed_blocks(
+                pgdata, rel_seg_path, snap_lsn, seg_idx * SEGMENT_PAGES
+            )
+        )
+    return out, bytes_scanned
+
+
 def fetch_rows_for_ctids(conn, schema, table, ctids,
                          column_types, added_defaults=None):
     """Fetch live rows by ctid, casting every data column to text.
@@ -883,6 +1111,75 @@ def _table_column_types(schema_dump, key):
     if t is None:
         return {}
     return {c["name"]: c["type"] for c in t["columns"]}
+
+
+def fetch_rows_by_pk(conn, schema, table, pk_names, pk_values, column_types,
+                     added_defaults=None):
+    """Fetch rows by primary key (as text). pk_values is an iterable of
+    text-tuples matching pk_names in order. Returns (cols, rows).
+
+    `added_defaults`: same semantics as `fetch_rows_for_ctids`.
+    """
+    pk_values = list(pk_values)
+    if not pk_values or not pk_names:
+        return [], []
+    select_parts = ['ctid::text AS ctid']
+    for col in column_types:
+        q = '"' + col.replace('"', '""') + '"'
+        select_parts.append(f'{q}::text AS {q}')
+    if added_defaults:
+        for col, expr in added_defaults.items():
+            default_sql = expr if expr is not None else "NULL"
+            qc = '"' + col.replace('"', '""') + '"'
+            select_parts.append(
+                f'({qc} IS DISTINCT FROM ({default_sql})) AS "__vka_diff_{col}"'
+            )
+    pk_select = "(" + ", ".join(f'"{c}"::text' for c in pk_names) + ")"
+    placeholders = ", ".join(
+        ["(" + ", ".join(["%s"] * len(pk_names)) + ")" for _ in pk_values]
+    )
+    flat = [v for pk in pk_values for v in pk]
+    sql_text = (
+        f'SELECT {", ".join(select_parts)} FROM "{schema}"."{table}" '
+        f'WHERE {pk_select} IN ({placeholders})'
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql_text, flat)
+        cols = [d.name for d in cur.description]
+        return cols, cur.fetchall()
+
+
+def _row_data_dict(cols, row):
+    """Strip ctid and __vka_diff_* synthetic cols. Return {colname: text_value}."""
+    out = {}
+    for i, c in enumerate(cols):
+        if c == "ctid" or c.startswith("__vka_diff_"):
+            continue
+        out[c] = row[i]
+    return out
+
+
+def _diff_flags(cols, row):
+    """Return {colname: bool} for __vka_diff_<col> entries."""
+    out = {}
+    for i, c in enumerate(cols):
+        if c.startswith("__vka_diff_"):
+            out[c[len("__vka_diff_"):]] = row[i]
+    return out
+
+
+def _row_changed_vs_base(branch_dict, base_dict, branch_diff_flags):
+    """A row on branch is changed relative to base if any common column
+    differs OR if any column added by branch has a non-default value.
+    base_dict has only common cols (it's from base's schema).
+    """
+    for c, bv in base_dict.items():
+        if branch_dict.get(c) != bv:
+            return True
+    for col, differs in branch_diff_flags.items():
+        if differs:
+            return True
+    return False
 
 
 def live_ctids_for_block(pgdata, relpath, block):
@@ -1259,6 +1556,450 @@ def _sql_text_literal(text_value, typename):
 
 
 # ---------- main ----------
+
+def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
+                     *, parent_snap_path=None, verbose=False):
+    """3-way diff. `base_db` is the COW snapshot of `source_db` at branch
+    creation time; used as the merge base.
+
+    Returns a dict with the same keys as `cross_diff` plus:
+      - "conflicts": list of dicts. Non-empty means abort the apply.
+      - "drifts":    list of dicts. Parent changed these independently.
+
+    On conflict, no SQL is emitted for the conflicted parts; the caller
+    should not apply.
+    """
+    with open(snap_path) as f:
+        snap = json.load(f)
+    snap_lsn = parse_lsn_str(snap["lsn"])
+    snap_by_oid = {r["oid"]: r for r in snap["relations"]}
+
+    # Parent (source) snapshot — used for stat-skip on main side so we
+    # don't have to LSN-scan every page of every relation on main.
+    parent_snap_by_oid = {}
+    if parent_snap_path:
+        with open(parent_snap_path) as f:
+            parent_snap = json.load(f)
+        parent_snap_by_oid = {r["oid"]: r for r in parent_snap["relations"]}
+
+    def dsn(db):
+        return f"host=127.0.0.1 dbname={db} user={os.environ.get('USER','aybarsb')}"
+
+    t0 = time.perf_counter()
+    totals = {
+        "INSERT": 0, "UPDATE": 0, "DELETE": 0,
+        "DDL_PRE": 0, "DDL_POST": 0,
+        "scanned_files": 0, "scanned_bytes": 0, "skipped_files": 0,
+        "rels_with_changes": 0,
+    }
+    ddl_pre = []
+    ddl_post = []
+    sql_out = []  # DML
+    conflicts = []
+    drifts = []
+
+    with psycopg.connect(dsn(current_db), autocommit=True) as cur_conn, \
+         psycopg.connect(dsn(source_db), autocommit=True) as src_conn, \
+         psycopg.connect(dsn(base_db), autocommit=True) as base_conn:
+
+        for c in (cur_conn, src_conn, base_conn):
+            with c.cursor() as cur:
+                cur.execute("CHECKPOINT")
+
+        # ---- Schema 3-way ----
+        base_schema = dump_schema(base_conn)
+        main_schema = dump_schema(src_conn)
+        branch_schema = dump_schema(cur_conn)
+        s_pre, s_post, s_conflicts, s_drifts = diff_schemas_3way(
+            base_schema, main_schema, branch_schema
+        )
+        ddl_pre.extend(s_pre)
+        ddl_post.extend(s_post)
+        conflicts.extend(s_conflicts)
+        drifts.extend(s_drifts)
+        totals["DDL_PRE"] = len(ddl_pre)
+        totals["DDL_POST"] = len(ddl_post)
+
+        # If schema-level conflicts, return early — don't even try DML.
+        if conflicts:
+            totals["elapsed_ms"] = (time.perf_counter() - t0) * 1000
+            totals["sql"] = []
+            totals["ddl_pre"] = ddl_pre
+            totals["ddl_post"] = ddl_post
+            totals["dml"] = []
+            totals["conflicts"] = conflicts
+            totals["drifts"] = drifts
+            if verbose or __name__ == "__main__":
+                print()
+                print(f"cross-diff-3way ABORTED in {totals['elapsed_ms']:.0f} ms")
+                print(f"  conflicts: {len(conflicts)}")
+                for c in conflicts:
+                    print(f"    !! {c['kind']} {c['key']}")
+            return totals
+
+        # Per-table column-set added on branch but not yet on main (will be
+        # ADDed by ddl_pre). Same idea as 2-way: ask Postgres whether each
+        # row's value matches the column's DEFAULT.
+        added_cols_by_table = {}
+        for key, t in branch_schema["tables"].items():
+            mt = main_schema["tables"].get(key)
+            if mt is None:
+                continue
+            m_cols = {c["name"] for c in mt["columns"]}
+            added = {}
+            for c in t["columns"]:
+                if c["name"] not in m_cols:
+                    added[c["name"]] = c.get("default")
+            if added:
+                added_cols_by_table[key] = added
+
+        # ---- Brand-new tables on branch (not in base, not in main) ----
+        for key, t in branch_schema["tables"].items():
+            if key in main_schema["tables"] or key in base_schema["tables"]:
+                continue
+            new_types = _table_column_types(branch_schema, key)
+            data_cols = list(new_types.keys())
+            select_parts = ", ".join(f'"{c}"::text AS "{c}"' for c in data_cols) or "1"
+            with cur_conn.cursor() as cur:
+                cur.execute(
+                    f'SELECT {select_parts} FROM "{t["schema"]}"."{t["name"]}"'
+                )
+                rows = cur.fetchall()
+            if not rows:
+                continue
+            qn = f'"{t["schema"]}"."{t["name"]}"'
+            cols_s = ", ".join(f'"{c}"' for c in data_cols)
+            totals["rels_with_changes"] += 1
+            totals["INSERT"] += len(rows)
+            for r in rows:
+                vals_s = ", ".join(
+                    _sql_text_literal(v, new_types[c])
+                    for c, v in zip(data_cols, r)
+                )
+                sql_out.append(f"INSERT INTO {qn} ({cols_s}) VALUES ({vals_s});")
+
+        # ---- Row-level 3-way for tables present on both branch and main ----
+        cur_rels = list_relations(cur_conn)
+        src_rels = list_relations(src_conn)
+        base_rels = list_relations(base_conn)
+        src_relpath_by_name = {(r[0], r[1]): r[4] for r in src_rels}
+        base_relpath_by_name = {(r[0], r[1]): r[4] for r in base_rels}
+
+        for nsp, rel, oid, current_relfilenode, current_relpath in cur_rels:
+            key = f"{nsp}.{rel}"
+            if key not in base_schema["tables"]:
+                continue   # branch addition (handled above as new table)
+            if key not in main_schema["tables"]:
+                continue   # branch deleted; DDL_POST drops it on main
+
+            prev = snap_by_oid.get(oid)
+            if prev is None:
+                continue
+            if current_relfilenode != prev["relfilenode"]:
+                continue  # rare: rewrite on branch (VACUUM FULL etc.)
+
+            branch_blocks, b_bytes, b_files, b_skipped = (
+                find_changed_blocks_per_relation(
+                    pgdata, current_relpath, prev["segments"], snap_lsn
+                )
+            )
+            totals["scanned_bytes"] += b_bytes
+            totals["scanned_files"] += b_files
+            totals["skipped_files"] += b_skipped
+
+            main_relpath = src_relpath_by_name.get((nsp, rel))
+            base_relpath = base_relpath_by_name.get((nsp, rel))
+            if main_relpath is None or base_relpath is None:
+                continue
+
+            # Look up main's OID + parent-snapshot entry for stat-skip.
+            main_oid = next(
+                (r[2] for r in src_rels if r[0] == nsp and r[1] == rel),
+                None,
+            )
+            main_prev = parent_snap_by_oid.get(main_oid) if main_oid else None
+            if main_prev is not None and main_prev["relfilenode"] == \
+                    next(r[3] for r in src_rels if r[0] == nsp and r[1] == rel):
+                # Stat-skip path: only scan pages of segments that drifted.
+                main_blocks, m_bytes, m_files, m_skipped = (
+                    find_changed_blocks_per_relation(
+                        pgdata, main_relpath, main_prev["segments"], snap_lsn
+                    )
+                )
+                totals["scanned_bytes"] += m_bytes
+                totals["scanned_files"] += m_files
+                totals["skipped_files"] += m_skipped
+            else:
+                # Fall back to full LSN scan (older branches without a
+                # saved parent snapshot, or rewritten relations).
+                main_blocks, m_bytes = find_changed_blocks_lsn_only(
+                    pgdata, main_relpath, snap_lsn
+                )
+                totals["scanned_bytes"] += m_bytes
+
+            if not branch_blocks and not main_blocks:
+                continue
+
+            pk_cols = get_pk_columns(cur_conn, oid)
+            pk_names = [c[0] for c in pk_cols]
+            if not pk_names:
+                continue  # no-PK 3-way deferred
+
+            main_types   = _table_column_types(main_schema, key)
+            branch_types = _table_column_types(branch_schema, key)
+            base_types   = _table_column_types(base_schema, key)
+            added_for_this_tbl = added_cols_by_table.get(key, {})
+
+            # Candidate PK collection: read live ctids on changed pages from
+            # BOTH the changed side AND base. This finds deleted PKs (still
+            # alive on base, missing on current side) as well as inserted /
+            # updated PKs (alive on current).
+            def collect_pks_from_ctids(conn, schema, table, types, ctids):
+                if not ctids:
+                    return set()
+                cols, rows = fetch_rows_for_ctids(conn, schema, table, ctids, types)
+                if not cols or not rows:
+                    return set()
+                pk_idx = [cols.index(p) for p in pk_names]
+                return {tuple(r[i] for i in pk_idx) for r in rows}
+
+            candidate_pks = set()
+            # From branch's changed pages: live on branch (current state) + live on base (pre-change state)
+            br_ctids = []
+            base_ctids_branch_side = []
+            for block, _lsn in branch_blocks:
+                br_ctids.extend(live_ctids_for_block(pgdata, current_relpath, block))
+                base_ctids_branch_side.extend(live_ctids_for_block(pgdata, base_relpath, block))
+            candidate_pks |= collect_pks_from_ctids(cur_conn, nsp, rel, branch_types, br_ctids)
+            candidate_pks |= collect_pks_from_ctids(base_conn, nsp, rel, base_types, base_ctids_branch_side)
+            # From main's changed pages: live on main (current) + live on base (pre-change)
+            mn_ctids = []
+            base_ctids_main_side = []
+            for block, _lsn in main_blocks:
+                mn_ctids.extend(live_ctids_for_block(pgdata, main_relpath, block))
+                base_ctids_main_side.extend(live_ctids_for_block(pgdata, base_relpath, block))
+            candidate_pks |= collect_pks_from_ctids(src_conn, nsp, rel, main_types, mn_ctids)
+            candidate_pks |= collect_pks_from_ctids(base_conn, nsp, rel, base_types, base_ctids_main_side)
+
+            if not candidate_pks:
+                continue
+
+            # AUTHORITATIVE PK-based fetches: ask each DB for the current state
+            # of these PKs. A PK absent from a fetch result means that DB no
+            # longer has the row (deleted), not "we just didn't scan its page".
+            branch_cols, branch_rows = fetch_rows_by_pk(
+                cur_conn, nsp, rel, pk_names, candidate_pks, branch_types,
+                added_defaults=added_for_this_tbl,
+            )
+            main_cols_, main_rows = fetch_rows_by_pk(
+                src_conn, nsp, rel, pk_names, candidate_pks, main_types,
+            )
+            base_cols, base_rows = fetch_rows_by_pk(
+                base_conn, nsp, rel, pk_names, candidate_pks, base_types,
+            )
+
+            def pk_dict_map(cols, rows):
+                if not cols or not rows:
+                    return {}
+                pk_idx = [cols.index(p) for p in pk_names]
+                return {tuple(r[i] for i in pk_idx): (cols, r) for r in rows}
+
+            branch_map = pk_dict_map(branch_cols, branch_rows)
+            main_map = pk_dict_map(main_cols_, main_rows)
+            base_map_raw = pk_dict_map(base_cols, base_rows)
+            base_map = {
+                pk: _row_data_dict(c, r) for pk, (c, r) in base_map_raw.items()
+            }
+            all_pks = candidate_pks
+
+            tbl_inserts = []
+            tbl_updates = []
+            tbl_deletes = []
+
+            for pk in all_pks:
+                branch_pair = branch_map.get(pk)
+                main_pair = main_map.get(pk)
+                base_row = base_map.get(pk)
+
+                branch_data = (
+                    _row_data_dict(*branch_pair) if branch_pair else None
+                )
+                branch_flags = (
+                    _diff_flags(*branch_pair) if branch_pair else {}
+                )
+                main_data = _row_data_dict(*main_pair) if main_pair else None
+
+                # Classify what each side did to this row.
+                # branch's op:
+                if branch_data is None:
+                    if base_row is None:
+                        branch_op = "NOOP"
+                    else:
+                        branch_op = "DELETE"
+                else:
+                    if base_row is None:
+                        branch_op = "INSERT"
+                    else:
+                        if _row_changed_vs_base(branch_data, base_row, branch_flags):
+                            branch_op = "UPDATE"
+                        else:
+                            branch_op = "NOOP"
+
+                # main's op (no diff flags needed — main has same schema as base):
+                if main_data is None:
+                    if base_row is None:
+                        main_op = "NOOP"
+                    else:
+                        main_op = "DELETE"
+                else:
+                    if base_row is None:
+                        main_op = "INSERT"
+                    else:
+                        if any(main_data.get(c) != base_row.get(c) for c in base_row):
+                            main_op = "UPDATE"
+                        else:
+                            main_op = "NOOP"
+
+                if branch_op == "NOOP":
+                    if main_op != "NOOP":
+                        drifts.append({
+                            "kind": "row", "key": f"{key}#{pk}",
+                            "main_op": main_op,
+                        })
+                    continue
+
+                if main_op == "NOOP":
+                    # safe: apply branch's intent
+                    if branch_op == "INSERT":
+                        tbl_inserts.append(pk)
+                    elif branch_op == "DELETE":
+                        tbl_deletes.append(pk)
+                    elif branch_op == "UPDATE":
+                        tbl_updates.append(pk)
+                    continue
+
+                # Both touched the row.
+                if branch_op == main_op:
+                    # Same operation kind — same final value?
+                    if branch_op == "DELETE":
+                        continue  # both deleted: agreed
+                    if branch_op in ("INSERT", "UPDATE"):
+                        # Compare the resulting row on common cols
+                        common = set(main_data.keys()) & set(branch_data.keys())
+                        if all(main_data[c] == branch_data[c] for c in common):
+                            # Also check added cols don't differ from default
+                            if not any(branch_flags.values()):
+                                continue  # same change, both sides
+                conflicts.append({
+                    "kind": "row", "key": f"{key}#{pk}",
+                    "branch_op": branch_op, "main_op": main_op,
+                    "base": base_row,
+                    "main": main_data,
+                    "branch": branch_data,
+                })
+
+            if conflicts:
+                # we'll surface conflicts but keep iterating tables for full report
+                continue
+
+            if not (tbl_inserts or tbl_updates or tbl_deletes):
+                continue
+            totals["rels_with_changes"] += 1
+            totals["INSERT"] += len(tbl_inserts)
+            totals["UPDATE"] += len(tbl_updates)
+            totals["DELETE"] += len(tbl_deletes)
+            qn = f'"{nsp}"."{rel}"'
+
+            # Emit INSERTs
+            for pk in tbl_inserts:
+                cols, row = branch_map[pk]
+                data_cols = [c for c in cols
+                             if c != "ctid" and not c.startswith("__vka_diff_")]
+                col_idx = {c: i for i, c in enumerate(cols)}
+                vals = [row[col_idx[c]] for c in data_cols]
+                cols_s = ", ".join(f'"{c}"' for c in data_cols)
+                vals_s = ", ".join(
+                    _sql_text_literal(v, branch_types[c])
+                    for c, v in zip(data_cols, vals)
+                )
+                sql_out.append(f"INSERT INTO {qn} ({cols_s}) VALUES ({vals_s});")
+
+            # Emit UPDATEs: only changed cols, plus added-col where flag is True
+            for pk in tbl_updates:
+                cols, row = branch_map[pk]
+                col_idx = {c: i for i, c in enumerate(cols)}
+                base_row = base_map[pk]
+                set_clauses = []
+                # Common cols (in both base and branch)
+                for c in base_row:
+                    if c in pk_names:
+                        continue
+                    if c not in col_idx:
+                        continue
+                    new_v = row[col_idx[c]]
+                    old_v = base_row[c]
+                    if new_v != old_v:
+                        set_clauses.append(
+                            f'"{c}"={_sql_text_literal(new_v, branch_types[c])}'
+                        )
+                # Added cols (on branch but not in base) — emit if non-default
+                flags = _diff_flags(cols, row)
+                for c, differs in flags.items():
+                    if differs:
+                        new_v = row[col_idx[c]]
+                        set_clauses.append(
+                            f'"{c}"={_sql_text_literal(new_v, branch_types[c])}'
+                        )
+                if not set_clauses:
+                    continue
+                where = " AND ".join(
+                    f'"{c}"={_sql_text_literal(v, branch_types[c])}'
+                    for c, v in zip(pk_names, pk)
+                )
+                sql_out.append(
+                    f"UPDATE {qn} SET {', '.join(set_clauses)} WHERE {where};"
+                )
+
+            # Emit DELETEs
+            for pk in tbl_deletes:
+                where = " AND ".join(
+                    f'"{c}"={_sql_text_literal(v, main_types[c])}'
+                    for c, v in zip(pk_names, pk)
+                )
+                sql_out.append(f"DELETE FROM {qn} WHERE {where};")
+
+    final_sql = [] if conflicts else (list(ddl_pre) + list(sql_out) + list(ddl_post))
+    dt = (time.perf_counter() - t0) * 1000
+    totals["elapsed_ms"] = dt
+    totals["sql"] = final_sql
+    totals["ddl_pre"] = list(ddl_pre)
+    totals["ddl_post"] = list(ddl_post)
+    totals["dml"] = list(sql_out)
+    totals["conflicts"] = conflicts
+    totals["drifts"] = drifts
+
+    if verbose or __name__ == "__main__":
+        print()
+        print(f"cross-diff-3way complete in {dt:.0f} ms")
+        print(f"  DDL_PRE={totals['DDL_PRE']}  DDL_POST={totals['DDL_POST']}")
+        print(f"  INSERT={totals['INSERT']}  UPDATE={totals['UPDATE']}  DELETE={totals['DELETE']}")
+        print(f"  conflicts={len(conflicts)}  drifts={len(drifts)}")
+        if conflicts:
+            print("\n!! CONFLICTS (no SQL emitted):")
+            for c in conflicts:
+                print(f"   {c['kind']} {c['key']}: branch={c.get('branch_op','?')} main={c.get('main_op','?')}")
+        if drifts:
+            print("\n-- parent drift (left alone):")
+            for d in drifts[:10]:
+                print(f"   {d['kind']} {d['key']}")
+            if len(drifts) > 10:
+                print(f"   ... and {len(drifts) - 10} more")
+        if final_sql:
+            print("\n-- SQL diff --")
+            for s in final_sql:
+                print(s)
+    return totals
+
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("snapshot", "diff", "cross-diff"):

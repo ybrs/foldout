@@ -9,13 +9,17 @@ import click
 from . import __version__
 from .db import (
     copy_database_files,
+    create_base_database,
     create_branch_database,
     create_snapshot_database,
     database_exists,
     database_write_lock,
     delete_database_record,
+    drop_base_for_branch,
     drop_database,
+    get_branch_base,
     get_branch_parent,
+    get_branch_parent_snapshot_path,
     get_branch_snapshot_path,
     get_data_directory,
     get_database_oid,
@@ -24,6 +28,7 @@ from .db import (
     initialize_database,
     list_databases,
     log_branch_operation,
+    register_base_database,
     register_branch_database,
     register_snapshot_database,
     register_source_database,
@@ -76,13 +81,31 @@ def branch(database_name: str, branch_name: str) -> None:
         branch_database_name, target_oid = create_branch_database(database_name, branch_name)
         click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
         
+        # Create the base snapshot of the source (for 3-way diff merge base).
+        # COW copy from the same source, taken under the same write lock so
+        # all three (source, branch, base) are at the same LSN at branch time.
+        base_database_name, base_oid = create_base_database(database_name, branch_name)
+        click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
+
         # Lock the source database to prevent writes during copy
         with database_write_lock(database_name):
             click.echo(f"Acquired write lock on database '{database_name}'")
-            
-            # Copy database files
+
+            # Copy database files (source -> branch)
             copy_database_files(data_directory, source_oid, target_oid)
             click.echo("Database files copied successfully")
+
+            # Copy database files (source -> base)
+            copy_database_files(data_directory, source_oid, base_oid)
+            click.echo("Base snapshot files copied successfully")
+
+            # Take a page-diff snapshot of the PARENT while we still hold
+            # the write lock — guarantees the captured (size, mtime, relfilenode)
+            # values match the parent's exact state at branch creation. Used
+            # by 3-way diff to stat-skip parent files that haven't drifted.
+            parent_snap_path = get_branch_parent_snapshot_path(target_oid)
+            page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
+            click.echo(f"Saved parent snapshot: {parent_snap_path}")
 
         # Ensure change-capture is present on the new branch database as well
         if installer.ensure_installed(branch_database_name):
@@ -93,6 +116,10 @@ def branch(database_name: str, branch_name: str) -> None:
         # Register branch database in vka_databases table
         register_branch_database(branch_database_name, target_oid, source_oid)
         click.echo(f"Registered branch '{branch_database_name}' in vka_databases with parent OID {source_oid}")
+
+        # Register the base snapshot and link it to this branch (for 3-way diff)
+        register_base_database(base_database_name, base_oid, source_oid, target_oid)
+        click.echo(f"Registered base snapshot '{base_database_name}' (linked to branch '{branch_database_name}')")
         
         # Log branch creation operation
         log_branch_operation(source_oid, target_oid, branch_database_name)
@@ -305,20 +332,43 @@ def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
             )
 
         data_directory = get_data_directory()
+        base = get_branch_base(branch_name)
+
         if not sql_only:
             click.echo(f"Diffing branch '{branch_name}' against parent '{parent_name}'")
+            if base is not None:
+                click.echo(f"  base:     {base[1]} (3-way merge)")
+            else:
+                click.echo(f"  base:     (none — falling back to 2-way diff)")
+                click.echo(f"            recreate this branch to enable 3-way diff.")
             click.echo(f"  snapshot: {snap_path}")
             click.echo(f"  pgdata:   {data_directory}")
             click.echo()
 
-        result = page_diff.cross_diff(
-            data_directory, parent_name, branch_name, str(snap_path),
-            verbose=not sql_only,
-        )
+        if base is not None:
+            parent_snap_path = get_branch_parent_snapshot_path(branch_oid)
+            result = page_diff.cross_diff_3way(
+                data_directory, parent_name, branch_name, base[1], str(snap_path),
+                parent_snap_path=str(parent_snap_path) if parent_snap_path.exists() else None,
+                verbose=not sql_only,
+            )
+        else:
+            result = page_diff.cross_diff(
+                data_directory, parent_name, branch_name, str(snap_path),
+                verbose=not sql_only,
+            )
 
         if sql_only:
             for s in result["sql"]:
                 click.echo(s)
+
+        if result.get("conflicts"):
+            click.echo()
+            click.echo(f"{len(result['conflicts'])} conflict(s). Not applying.", err=True)
+            raise click.ClickException(
+                "Merge conflict. Resolve the listed conflicts on the branch "
+                "and re-run `vka diff`."
+            )
 
         if apply and result["sql"]:
             click.echo()
@@ -334,6 +384,15 @@ def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
                         cur.execute(s)
                 conn.commit()
             click.echo("Applied. Parent now contains branch's data changes.")
+
+            # On successful apply, the base snapshot is no longer needed.
+            dropped = drop_base_for_branch(branch_name)
+            if dropped:
+                click.echo(f"Dropped base snapshot '{dropped}'.")
+            # Parent stats snapshot also no longer needed.
+            parent_snap_path = get_branch_parent_snapshot_path(branch_oid)
+            if parent_snap_path.exists():
+                parent_snap_path.unlink()
 
     except Exception as e:
         click.echo(f"Error: {e}", err=True)

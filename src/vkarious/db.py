@@ -103,6 +103,13 @@ def get_branch_snapshot_path(branch_oid: int) -> Path:
     return get_snapshot_dir() / f"{branch_oid}.json"
 
 
+def get_branch_parent_snapshot_path(branch_oid: int) -> Path:
+    """Snapshot of the parent's file state at branch creation time.
+    Used by 3-way diff to stat-skip files where the parent hasn't drifted.
+    """
+    return get_snapshot_dir() / f"{branch_oid}_parent.json"
+
+
 def terminate_database_connections(database_name: str) -> int:
     """Terminate all connections to a database except the current one."""
     with connect() as conn:
@@ -176,6 +183,95 @@ def create_snapshot_database(source_database: str) -> tuple[str, int]:
             oid = cur.fetchone()[0]
             
     return snapshot_name, oid
+
+
+def create_base_database(source_database: str, branch_name: str) -> tuple[str, int]:
+    """Create a COW snapshot of source_database to serve as the merge base
+    for `vka diff` of `branch_name`. Returned name is `__base__<branch_name>`.
+    """
+    base_name = f"__base__{branch_name}"
+    with connect() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            pg_version = get_pg_major_version(conn)
+            if pg_version < 15:
+                cur.execute(f'CREATE DATABASE "{base_name}" ')
+            else:
+                cur.execute(f'CREATE DATABASE "{base_name}" STRATEGY=\'FILE_COPY\' ')
+            cur.execute("SELECT oid FROM pg_database WHERE datname = %s", (base_name,))
+            oid = cur.fetchone()[0]
+    return base_name, oid
+
+
+def register_base_database(base_name: str, base_oid: int, parent_oid: int,
+                           branch_oid: int) -> None:
+    """Insert the base into vka_databases and link it to its branch."""
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params['dbname'] = "vkarious"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO vka_databases (oid, datname, parent, created_at, type, status)
+                VALUES (%s, %s, %s, %s, 'base', 'live')
+            """, (base_oid, base_name, parent_oid, datetime.now()))
+            cur.execute(
+                "UPDATE vka_databases SET base_oid = %s WHERE oid = %s",
+                (base_oid, branch_oid),
+            )
+        conn.commit()
+
+
+def get_branch_base(branch_name: str) -> tuple[int, str] | None:
+    """Return (base_oid, base_datname) for a branch, or None if no base set."""
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params['dbname'] = "vkarious"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT vd.base_oid, pg.datname
+                FROM vka_databases vd
+                LEFT JOIN pg_database pg ON pg.oid = vd.base_oid
+                WHERE vd.datname = %s AND vd.type = 'branch'
+            """, (branch_name,))
+            row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    return row[0], row[1]
+
+
+def drop_base_for_branch(branch_name: str) -> str | None:
+    """Drop the base snapshot associated with a branch (after a successful merge).
+    Returns the base name dropped, or None if there was no base.
+    """
+    base = get_branch_base(branch_name)
+    if base is None:
+        return None
+    base_oid, base_name = base
+    if base_name is None:
+        return None
+    # DROP DATABASE
+    with connect() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{base_name}"')
+    # Remove vka_databases entries
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params['dbname'] = "vkarious"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM vka_databases WHERE oid = %s", (base_oid,))
+            cur.execute(
+                "UPDATE vka_databases SET base_oid = NULL WHERE datname = %s",
+                (branch_name,),
+            )
+        conn.commit()
+    return base_name
 
 
 def create_branch_database(source_database: str, branch_name: str) -> tuple[str, int]:
