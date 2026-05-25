@@ -1,16 +1,16 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/vkarious/`: core package. CLI entry in `cli.py`; database helpers in `db.py`; SQL migrations in `migration/`.
+- `src/foldout/`: core package. CLI entry in `cli.py`; database helpers in `db.py`; SQL migrations in `migration/`.
 - `tests/`: pytest suite for CLI and internals.
-- `pyproject.toml`: project metadata (Hatchling), script entry point `vkarious= vkarious.cli:cli`.
+- `pyproject.toml`: project metadata (Hatchling), script entry point `foldout= foldout.cli:cli`.
 - `README.md`: setup, configuration, and usage examples.
 
 ## Build, Test, and Development Commands
 - `uv venv`: create a Python 3.11+ virtual env.
 - `uv pip install -e .`: install in editable mode.
-- `uv run vkarious --help`: verify CLI wiring.
-- `uv run vkarious databases list`: example command; requires `VKA_DATABASE`.
+- `uv run foldout --help`: verify CLI wiring.
+- `uv run foldout databases list`: example command; requires `FLD_DATABASE`.
 - `uv run pytest -q`: run tests; adds `src/` to `PYTHONPATH` via pytest config.
 
 ## Coding Style & Naming Conventions
@@ -32,5 +32,5 @@
 - PRs: include a clear description, linked issues, reproduction/verification steps, and relevant CLI output (paste snippets). Ensure tests pass locally.
 
 ## Security & Configuration Tips
-- Configure `VKA_DATABASE` with a non-production DSN during development. Do not commit secrets.
+- Configure `FLD_DATABASE` with a non-production DSN during development. Do not commit secrets.
 - Snapshot/restore operations can be destructive; test against disposable databases.

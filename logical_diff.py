@@ -6,12 +6,12 @@ import psycopg
 from psycopg import sql, adapt
 
 def conn_for(dbname):
-    base = os.environ.get("VKA_DATABASE")
+    base = os.environ.get("FLD_DATABASE")
     if not base:
-        raise RuntimeError("VKA_DATABASE is not set")
+        raise RuntimeError("FLD_DATABASE is not set")
     u = urlparse(base)
     if u.scheme not in ("postgresql", "postgres"):
-        raise RuntimeError("VKA_DATABASE must be a postgresql:// or postgres:// URL")
+        raise RuntimeError("FLD_DATABASE must be a postgresql:// or postgres:// URL")
     new_path = "/" + dbname
     dsn = urlunparse((u.scheme, u.netloc, new_path, u.params, u.query, u.fragment))
     return psycopg.connect(dsn)

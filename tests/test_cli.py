@@ -1,7 +1,7 @@
 from click.testing import CliRunner
 
-from vkarious import __version__
-from vkarious.cli import cli
+from foldout import __version__
+from foldout.cli import cli
 
 
 def test_version_command() -> None:

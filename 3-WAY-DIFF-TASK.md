@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make `vkarious diff <branch>` git-like: report and propagate only the
+Make `foldout diff <branch>` git-like: report and propagate only the
 changes the branch made since it was created, not "everything that
 differs between branch and parent right now". Specifically:
 
@@ -43,20 +43,20 @@ For any object O (table / column / index / row …):
 
 ## How we get BASE — without writing anything new
 
-vkarious already creates branches via COW file copies in ~milliseconds.
+foldout already creates branches via COW file copies in ~milliseconds.
 We use the same mechanism for the merge base:
 
-**At `vkarious branch main feat1` time, additionally create a COW snapshot
+**At `foldout branch main feat1` time, additionally create a COW snapshot
 of `main` and tag it as the branch's base.** It's a real Postgres
 database we can query (schema + rows). Storage cost is ~0 because COW
 shares pages with `main` until either side writes.
 
-Tagging: extend `vka_databases` with a `base_for` column (or a new
+Tagging: extend `fld_databases` with a `base_for` column (or a new
 `type='base'` row pointing at the branch). Naming: `__base__feat1`
 (prefix chosen so users don't accidentally connect to it for editing).
 
 When the branch is dropped (`vka delete branch …`), drop the base too.
-When the branch is "merged" (`vka diff --apply` succeeds without
+When the branch is "merged" (`fld diff --apply` succeeds without
 conflicts), the base can be safely dropped too (the branch's changes
 are now in main; the base is no longer the reference point).
 
@@ -133,7 +133,7 @@ Then the 3-way logic exactly mirrors the schema case:
 
 **Abort with a structured conflict report.** No partial apply. List each
 conflicted object/row with all three sides so the user can see what
-diverged. Exit non-zero from `vka diff --apply`. Plain `vka diff`
+diverged. Exit non-zero from `fld diff --apply`. Plain `fld diff`
 (preview) still prints the planned SQL above the conflict report so the
 user sees what *would* run if conflicts were resolved.
 
@@ -142,19 +142,19 @@ for v1).
 
 ## API and CLI changes
 
-- `vka_databases`: add a relation from a branch to its base snapshot.
+- `fld_databases`: add a relation from a branch to its base snapshot.
   Either a new column on the branch row (`base_oid`) or a new row with
   `type='base', parent=branch_oid`. Lean toward the column for
   simplicity.
-- `vkarious branch <main> <name>`: after the existing COW copy, take a
+- `foldout branch <main> <name>`: after the existing COW copy, take a
   **second** COW copy of `<main>` named `__base__<name>`, register the
   link, and snapshot its page-diff state into
-  `~/.vkarious/snapshots/<branch_oid>.json` (same file we already write).
-- `vkarious diff <branch>`:
+  `~/.foldout/snapshots/<branch_oid>.json` (same file we already write).
+- `foldout diff <branch>`:
   - If branch has a base → 3-way diff.
   - If no base (older branch from before this feature) → warn and fall
     back to 2-way with a hint to recreate the branch.
-- `vkarious diff <branch> --apply`: abort on conflict, exit non-zero.
+- `foldout diff <branch> --apply`: abort on conflict, exit non-zero.
 
 ## Out of scope (deferred)
 
@@ -182,10 +182,10 @@ for v1).
 
 ## Files this will touch
 
-- `src/vkarious/cli.py` — `branch` (create base), `diff` (3-way path).
-- `src/vkarious/db.py` — base-snapshot tracking in `vka_databases`.
-- `src/vkarious/page_diff.py` — `dump_schema_3way`, `cross_diff_3way`.
-- `src/vkarious/migration/vkarious_3.sql` — schema migration to add
+- `src/foldout/cli.py` — `branch` (create base), `diff` (3-way path).
+- `src/foldout/db.py` — base-snapshot tracking in `fld_databases`.
+- `src/foldout/page_diff.py` — `dump_schema_3way`, `cross_diff_3way`.
+- `src/foldout/migration/foldout_3.sql` — schema migration to add
   base linkage.
 - `tests/test_page_diff.py` — new conflict + drift scenarios.
 
@@ -220,17 +220,17 @@ for v1).
   (`<branch_oid>_parent.json`) — used for stat-skip on the parent side
   during diff (restored 3-way diff time from ~22 s to ~170 ms on a
   4.76 GB DB).
-- ✅ `vka_databases` schema migration `vkarious_3.sql` adds `base_oid`
+- ✅ `fld_databases` schema migration `foldout_3.sql` adds `base_oid`
   column linking a branch to its base snapshot.
-- ✅ Successful `vka diff --apply` auto-drops the base DB + parent
+- ✅ Successful `fld diff --apply` auto-drops the base DB + parent
   snapshot file.
 
 ### Done — CLI
 
-- ✅ `vka diff <branch>` uses 3-way when a base exists.
-- ✅ Preview mode (`vka diff` without `--apply`) always exits 0 — even
+- ✅ `fld diff <branch>` uses 3-way when a base exists.
+- ✅ Preview mode (`fld diff` without `--apply`) always exits 0 — even
   with conflicts. Conflicts and drifts are reported for the user to see.
-- ✅ `vka diff --apply` exits non-zero on any conflict; nothing is
+- ✅ `fld diff --apply` exits non-zero on any conflict; nothing is
   applied to the parent.
 - ✅ When a branch has no base (legacy branch, or post-apply re-run):
   - Prominent yellow/bold warning on stderr explaining the risk.
@@ -244,7 +244,7 @@ for v1).
 | `tests/test_schema_3way.py` | 9 | unit-level 3-way merge matrix (no Postgres) |
 | `tests/test_page_diff.py`   | 24 | e2e for `cross_diff()` (2-way path; regression safety) |
 | `tests/test_page_diff_3way.py` | 12 | e2e for `cross_diff_3way()` — parent-drift, both-sides changes, conflicts, deletes |
-| `tests/test_cli_diff.py`    | 9 | full CLI path: `vka branch` + `vka diff` + `--apply` + exit codes + base lifecycle + 2-way fallback hardening |
+| `tests/test_cli_diff.py`    | 9 | full CLI path: `vka branch` + `fld diff` + `--apply` + exit codes + base lifecycle + 2-way fallback hardening |
 
 CLI test scenarios:
 

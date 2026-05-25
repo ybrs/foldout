@@ -1,78 +1,78 @@
-# vkarious
+# foldout
 
-vkarious is a tool to create snapshots and branches of PostgreSQL databases.
+foldout is a tool to create snapshots and branches of PostgreSQL databases.
 
-Important: This project is an active work-in-progress. Expect rapid changes, occasional instability, and breaking changes as features evolve. To get notified about updates, use the Watch button on the repository (choose "All Activity"). Manage your watch settings for this repo at: https://github.com/ybrs/vkarious/subscription
+Important: This project is an active work-in-progress. Expect rapid changes, occasional instability, and breaking changes as features evolve. To get notified about updates, use the Watch button on the repository (choose "All Activity"). Manage your watch settings for this repo at: https://github.com/ybrs/foldout/subscription
 
 ## Configuration
 
-Set the `VKA_DATABASE` environment variable to your PostgreSQL connection string:
+Set the `FLD_DATABASE` environment variable to your PostgreSQL connection string:
 
 ```bash
-export VKA_DATABASE="postgresql://username:password@localhost:5432/database_name"
+export FLD_DATABASE="postgresql://username:password@localhost:5432/database_name"
 ```
 
-Optionally, set `VKA_PG_DATA_PATH` to override the detected PostgreSQL data directory. This is useful when PostgreSQL runs in a container but vkarious runs on the host and needs a host-visible path for copying database files (e.g., COW file copies):
+Optionally, set `FLD_PG_DATA_PATH` to override the detected PostgreSQL data directory. This is useful when PostgreSQL runs in a container but foldout runs on the host and needs a host-visible path for copying database files (e.g., COW file copies):
 
 ```bash
 # Example: host path where the container's PGDATA is mounted
-export VKA_PG_DATA_PATH="/Users/me/docker-volumes/postgres-data"
+export FLD_PG_DATA_PATH="/Users/me/docker-volumes/postgres-data"
 ```
 
 ## Usage
 
 List all databases:
 ```bash
-vkarious databases list
+foldout databases list
 ```
 
 Create a snapshot:
 ```bash
-vkarious snapshot database_name
+foldout snapshot database_name
 ```
 
 Create a branch with a custom name:
 ```bash
-vkarious branch database_name branch_name
+foldout branch database_name branch_name
 ```
 
-When `VKA_PG_DATA_PATH` is set, vkarious uses that directory for physical file operations instead of querying `SHOW data_directory` from PostgreSQL.
+When `FLD_PG_DATA_PATH` is set, foldout uses that directory for physical file operations instead of querying `SHOW data_directory` from PostgreSQL.
 
 List snapshots:
 ```bash
-vkarious snapshots list
+foldout snapshots list
 ```
 
 Restore from a snapshot:
 ```bash
-vkarious snapshots restore database_name snapshot_name
+foldout snapshots restore database_name snapshot_name
 ```
 
 Delete a snapshot:
 ```bash
-vkarious snapshots delete snapshot_name
+foldout snapshots delete snapshot_name
 ```
 
 Check version:
 ```bash
-vkarious version
+foldout version
 ```
 
 Show what changed on a branch (relative to its parent):
 ```bash
-vkarious diff branch_name           # preview SQL only
-vkarious diff branch_name --apply   # apply changes to the parent
+foldout diff branch_name           # preview SQL only
+foldout diff branch_name --apply   # apply changes to the parent
 ```
 
-## How `vkarious diff` works
+## How `foldout diff` works
 
-At `vkarious branch` time, vkarious records a small snapshot file under
-`~/.vkarious/snapshots/<branch_oid>.json` capturing:
+At `foldout branch` time, foldout records a small snapshot file under
+`~/.foldout/snapshots/<branch_oid>.json` capturing:
 
 - The WAL LSN at the moment of branching.
 - For every relation: `(relfilenode, segment_path, size, mtime_ns)`.
 
-At `vkarious diff` time, we do two things on top of these snapshots —
+At `foldout diff` time, we do two things on top of these snapshots —
 **both entirely read-only** on the parent and the branch.
 
 ### Schema (DDL) diff — catalog comparison
@@ -111,7 +111,7 @@ values. This works for any type with normal text I/O — built-in types
 and extension types (e.g. PostGIS geometry). The diff code itself is
 type-free.
 
-## `vkarious diff` — requirements, limitations, portability
+## `foldout diff` — requirements, limitations, portability
 
 ### Hard requirements
 - **CLI must run on the same host as PostgreSQL.** We read `PGDATA`
@@ -145,21 +145,21 @@ type-free.
   would silently underreport. Workaround: avoid unlogged tables in
   branched databases.
 - **Hot standby replicas** can't run `CHECKPOINT`.
-- **Two-way diff only (for now).** `vkarious diff` compares branch
+- **Two-way diff only (for now).** `foldout diff` compares branch
   vs. parent's *current* state. If the parent has independent changes
   since the branch was created, those would appear as inverse DROPs.
   See `3-WAY-DIFF-TASK.md` for the planned three-way diff using the
   snapshot as the merge base.
 
 ### Background docs
-- `DATABASE-DIFF-TASK.md` — design and approach for `vkarious diff`.
+- `DATABASE-DIFF-TASK.md` — design and approach for `foldout diff`.
 - `3-WAY-DIFF-TASK.md` — planned three-way diff.
 - `notes.md` — hashing benchmark numbers (alternative diff approach).
 
 # Example
 ```
-export VKA_DATABASE="postgresql://@localhost:5432/postgres"
-(vkarious) $ uv run vkarious databases list
+export FLD_DATABASE="postgresql://@localhost:5432/postgres"
+(foldout) $ uv run foldout databases list
 OID        Database Name
 ------------------------------
 14042      postgres
@@ -178,7 +178,7 @@ Install the project in editable mode and run the CLI using
 ```bash
 uv venv
 uv pip install -e .
-uv run vkarious --help
+uv run foldout --help
 ```
 
 Run the test suite with:

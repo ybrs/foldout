@@ -13,10 +13,10 @@ directly as Python functions. They do not exercise the *user-facing*
 path:
 
 - `vka branch <main> <branch>` — does the COW copy, registers base in
-  `vka_databases`, takes both snapshots
-- `vka diff <branch>` — looks up branch + base, picks 3-way path,
+  `fld_databases`, takes both snapshots
+- `fld diff <branch>` — looks up branch + base, picks 3-way path,
   produces SQL preview
-- `vka diff <branch> --apply` — applies SQL, drops the base snapshot,
+- `fld diff <branch> --apply` — applies SQL, drops the base snapshot,
   exits non-zero on conflict
 
 Bugs in catalog tracking, snapshot path resolution, base lookup,
@@ -24,12 +24,12 @@ auto-cleanup, or exit codes would all slip past the existing tests.
 
 ### Scope
 A new test module `tests/test_cli_diff.py` that drives the actual
-`vkarious` CLI binary via `subprocess`, asserts on its output and exit
+`foldout` CLI binary via `subprocess`, asserts on its output and exit
 codes, and verifies post-state via SQL.
 
 ### Scenarios
 
-| # | Branch does | Parent does | `vka diff` expected | `vka diff --apply` expected |
+| # | Branch does | Parent does | `fld diff` expected | `fld diff --apply` expected |
 |---|---|---|---|---|
 | 1 | nothing | nothing | "no changes" | exit 0, no-op |
 | 2 | add table | nothing | DDL+INSERTs | exit 0; parent has new table |
@@ -40,7 +40,7 @@ codes, and verifies post-state via SQL.
 | 7 | normal merge | nothing | (re-run after apply) | exit 0; base already dropped, falls back gracefully |
 
 ### Acceptance criteria
-- Test file uses `subprocess.run(['.venv/bin/vkarious', 'diff', ...])`,
+- Test file uses `subprocess.run(['.venv/bin/foldout', 'diff', ...])`,
   parses stdout/stderr, asserts exit code.
 - Each scenario sets up its own throwaway parent + branch DBs and
   cleans up at the end (regardless of test outcome).
@@ -48,9 +48,9 @@ codes, and verifies post-state via SQL.
 - All 7 scenarios pass.
 
 ### Tricky bits
-- The CLI requires `VKA_DATABASE` env var. Tests must set it.
+- The CLI requires `FLD_DATABASE` env var. Tests must set it.
 - Branch creation calls `register_branch_database` which writes to the
-  `vkarious` metadata DB. Tests must clean those rows up afterwards.
+  `foldout` metadata DB. Tests must clean those rows up afterwards.
 - The `__base__<branch>` snapshot DB also needs cleanup if `--apply`
   isn't reached or fails.
 
@@ -127,7 +127,7 @@ Add scenarios:
 
 ### Why
 Branches created before 3-way landed (or with the base DB manually
-dropped) have no merge base. Today `vka diff` already falls back to
+dropped) have no merge base. Today `fld diff` already falls back to
 2-way for these — but the warning is buried in normal diff output
 ("base: (none — falling back to 2-way diff)"). Users skimming the
 output can easily miss it. Worse, in `--apply` mode, the warning is
@@ -164,9 +164,9 @@ confirmation step.
    `vka delete <branch> && vka branch <parent> <branch>` (today).
 
 ### Scope
-- `src/vkarious/cli.py`:
+- `src/foldout/cli.py`:
   - Detect missing base → print the prominent warning
-  - Add `--allow-2way-apply` flag to `vka diff`
+  - Add `--allow-2way-apply` flag to `fld diff`
   - Refuse `--apply` without that flag when base is missing
 - No engine changes (`cross_diff` already exists).
 

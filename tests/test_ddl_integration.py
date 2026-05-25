@@ -31,26 +31,26 @@ _cleanup_dbs: List[str] = []  # Databases to clean up on success
 
 def get_connection_dsn() -> str:
     """Get PostgreSQL connection string from environment."""
-    dsn = os.environ.get("VKA_DATABASE")
+    dsn = os.environ.get("FLD_DATABASE")
     if not dsn:
         if PYTEST_AVAILABLE:
-            pytest.skip("VKA_DATABASE environment variable not set")
+            pytest.skip("FLD_DATABASE environment variable not set")
         else:
-            raise RuntimeError("VKA_DATABASE environment variable not set")
+            raise RuntimeError("FLD_DATABASE environment variable not set")
     return dsn
 
 
-def run_vkarious_command(cmd: List[str]) -> Tuple[int, str, str]:
-    """Run a vkarious command and return exit code, stdout, stderr."""
-    # Use vkarious executable from venv
-    vkarious_bin = ".venv/bin/vkarious"
-    if not os.path.exists(vkarious_bin):
+def run_foldout_command(cmd: List[str]) -> Tuple[int, str, str]:
+    """Run a foldout command and return exit code, stdout, stderr."""
+    # Use foldout executable from venv
+    foldout_bin = ".venv/bin/foldout"
+    if not os.path.exists(foldout_bin):
         if PYTEST_AVAILABLE:
-            pytest.skip("vkarious executable not found at .venv/bin/vkarious")
+            pytest.skip("foldout executable not found at .venv/bin/foldout")
         else:
-            raise RuntimeError("vkarious executable not found at .venv/bin/vkarious")
+            raise RuntimeError("foldout executable not found at .venv/bin/foldout")
     
-    full_cmd = [vkarious_bin] + cmd
+    full_cmd = [foldout_bin] + cmd
     
     result = subprocess.run(
         full_cmd,
@@ -127,7 +127,7 @@ def execute_sql(dsn: str, dbname: str, sql: str) -> List[Tuple]:
 
 def setup_test_database() -> str:
     """
-    Set up a test database with vkarious DDL logging enabled.
+    Set up a test database with foldout DDL logging enabled.
     
     Creates a unique source database, branches it, and returns the branch database name.
     This setup is shared across multiple test cases.
@@ -139,8 +139,8 @@ def setup_test_database() -> str:
     
     # Generate unique database names using timestamp and UUID
     test_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    source_db = f"vka_test_source_{test_id}"
-    branch_db = f"vka_test_branch_{test_id}"
+    source_db = f"fld_test_source_{test_id}"
+    branch_db = f"fld_test_branch_{test_id}"
     
     try:
         print(f"Setting up test databases: {source_db} -> {branch_db}")
@@ -150,36 +150,36 @@ def setup_test_database() -> str:
         create_database(dsn, source_db)
         _cleanup_dbs.append(source_db)
         
-        # Step 2: Create branch using vkarious
+        # Step 2: Create branch using foldout
         print(f"Creating branch: {source_db} -> {branch_db}")
-        exit_code, stdout, stderr = run_vkarious_command(["branch", source_db, branch_db])
+        exit_code, stdout, stderr = run_foldout_command(["branch", source_db, branch_db])
         
         if exit_code != 0:
-            print(f"vkarious branch command failed:")
+            print(f"foldout branch command failed:")
             print(f"Exit code: {exit_code}")
             print(f"Stdout: {stdout}")
             print(f"Stderr: {stderr}")
-            raise Exception(f"vkarious branch command failed with exit code {exit_code}")
+            raise Exception(f"foldout branch command failed with exit code {exit_code}")
         
         _cleanup_dbs.append(branch_db)
         print("Branch created successfully")
         
-        # Step 3: Verify branch database exists and has vkarious schema
-        print(f"Verifying branch database {branch_db} has vkarious schema")
+        # Step 3: Verify branch database exists and has foldout schema
+        print(f"Verifying branch database {branch_db} has foldout schema")
         result = execute_sql(dsn, branch_db, """
-            SELECT 1 FROM pg_namespace WHERE nspname = 'vkarious'
+            SELECT 1 FROM pg_namespace WHERE nspname = 'foldout'
         """)
-        assert len(result) > 0, "vkarious schema not found in branch database"
+        assert len(result) > 0, "foldout schema not found in branch database"
         
         result = execute_sql(dsn, branch_db, """
             SELECT 1 FROM pg_class c 
             JOIN pg_namespace n ON n.oid = c.relnamespace 
-            WHERE n.nspname = 'vkarious' AND c.relname = 'ddl_log'
+            WHERE n.nspname = 'foldout' AND c.relname = 'ddl_log'
         """)
-        assert len(result) > 0, "vkarious.ddl_log table not found in branch database"
+        assert len(result) > 0, "foldout.ddl_log table not found in branch database"
         
         # Clear any existing DDL log entries to start fresh
-        execute_sql(dsn, branch_db, "DELETE FROM vkarious.ddl_log")
+        execute_sql(dsn, branch_db, "DELETE FROM foldout.ddl_log")
         
         # Store the branch database for reuse
         _test_databases[test_id] = branch_db
@@ -250,7 +250,7 @@ def test_create_alter_table_logging():
                 object_identity, 
                 phase,
                 CASE WHEN sql_text IS NOT NULL THEN 'HAS_SQL' ELSE 'NO_SQL' END as has_sql
-            FROM vkarious.ddl_log 
+            FROM foldout.ddl_log 
             WHERE object_type = 'table' 
               AND schema_name = 'public'
               AND object_identity = 'public.test_create_alter'
@@ -280,7 +280,7 @@ def test_create_alter_table_logging():
     except Exception as e:
         print(f"❌ CREATE/ALTER TABLE logging test failed: {e}")
         print(f"Leaving test databases for debugging: {_cleanup_dbs}")
-        print(f"To check DDL log: psql {dsn.rsplit('/', 1)[0]}/{branch_db} -c \"SELECT * FROM vkarious.ddl_log ORDER BY id;\"")
+        print(f"To check DDL log: psql {dsn.rsplit('/', 1)[0]}/{branch_db} -c \"SELECT * FROM foldout.ddl_log ORDER BY id;\"")
         raise
 
 
@@ -327,7 +327,7 @@ def test_drop_table_logging():
                 object_identity, 
                 phase,
                 CASE WHEN sql_text IS NOT NULL THEN 'HAS_SQL' ELSE 'NO_SQL' END as has_sql
-            FROM vkarious.ddl_log 
+            FROM foldout.ddl_log 
             WHERE object_type = 'table' 
               AND schema_name = 'public'
               AND object_identity = 'public.test_drop_table'
@@ -357,7 +357,7 @@ def test_drop_table_logging():
     except Exception as e:
         print(f"❌ DROP TABLE logging test failed: {e}")
         print(f"Leaving test databases for debugging: {_cleanup_dbs}")
-        print(f"To check DDL log: psql {dsn.rsplit('/', 1)[0]}/{branch_db} -c \"SELECT * FROM vkarious.ddl_log ORDER BY id;\"")
+        print(f"To check DDL log: psql {dsn.rsplit('/', 1)[0]}/{branch_db} -c \"SELECT * FROM foldout.ddl_log ORDER BY id;\"")
         raise
 
 

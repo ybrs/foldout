@@ -3,7 +3,7 @@ version: "3.9"
 services:
   postgres:
     image: postgres:17
-    container_name: vkarious-pg17
+    container_name: foldout-pg17
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -21,14 +21,14 @@ services:
 
   devtools:
     build: .
-    container_name: vkarious-devtools
+    container_name: foldout-devtools
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      VKA_DATABASE: postgresql://postgres:postgres@postgres:5432/postgres
+      FLD_DATABASE: postgresql://postgres:postgres@postgres:5432/postgres
     command: ["sleep", "infinity"]
 
 networks:
   default:
-    name: vkarious-net
+    name: foldout-net

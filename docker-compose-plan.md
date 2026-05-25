@@ -36,7 +36,7 @@ Goal: Run PostgreSQL 17 via Docker Compose for local development on macOS (APFS 
    - Connect: `psql "postgresql://postgres:postgres@postgres:5432/postgres"`
 4) To stop: `docker compose down` (use `-v` to remove volumes if you switch to named volumes).
 
-## Environment for vkarious
+## Environment for foldout
 - Example DSN (reachable inside the compose network):
   - `postgresql://postgres:postgres@postgres:5432/postgres`
 - Example DSN (reachable from host when port is published to 5444):

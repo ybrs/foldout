@@ -1,4 +1,4 @@
-# vkarious — performance notes
+# foldout — performance notes
 
 ## Benchmark target
 
@@ -33,7 +33,7 @@ Sorting tables by size descending and assigning each next table to the currently
 - 4 workers: 15.73 s → 11.99 s (1.31× improvement)
 - 8 workers: 13.60 s →  9.38 s (1.45× improvement)
 
-Implementation in `hash_rust/src/main.rs::partition_lpt`, toggled by `VKA_HASH_LPT` (default on).
+Implementation in `hash_rust/src/main.rs::partition_lpt`, toggled by `FLD_HASH_LPT` (default on).
 
 ### Why `pg_hashdb` was slow
 
@@ -89,5 +89,5 @@ Time: 47156.597 ms (00:47.157)
 
 - **Target met**: ~9 s for a 5 GB DB on a MacBook Air is acceptable as a baseline.
 - **Per-table parallelism (intra-table TID/CTID range hashing)** is the only way to push below the current ~6.6 s floor. Splitting `runtime_commandrunhistory` into N ctid ranges, hashing each in parallel, and combining Merkle-style would help the cold-path case for very large tables.
-- **Trigger-based merge** (via `vkarious.change_log`) makes hashing unnecessary on the hot path of a merge. Hashing becomes a verification step and a fallback for tables without a primary key.
+- **Trigger-based merge** (via `foldout.change_log`) makes hashing unnecessary on the hot path of a merge. Hashing becomes a verification step and a fallback for tables without a primary key.
 - **`pg_hashdb` is not the right tool for full-DB hashing** given the parallelism constraint inside a Postgres backend. Keep it as the per-table primitive if/when we want a server-side fallback.

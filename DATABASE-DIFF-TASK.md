@@ -2,7 +2,7 @@
 
 ## Goal
 
-Given two databases that share a common ancestor (a vkarious branch and its
+Given two databases that share a common ancestor (a foldout branch and its
 source, or two branches of the same source), efficiently identify the
 row-level and schema-level differences so we can:
 
@@ -28,7 +28,7 @@ Postgres tracks every write at the page level.
 
 ## The key insight: layered filtering, finest possible signal at each layer
 
-When vkarious branches a database it does a COW copy of PGDATA at a known
+When foldout branches a database it does a COW copy of PGDATA at a known
 point in time. Three pieces of metadata together let us pinpoint changes
 without scanning data:
 
@@ -148,7 +148,7 @@ Verification pass: re-run `hash_rust` on both sides post-merge.
    setup and one catalog query. For an "every clone takes a snapshot" model
    this should be sub-100 ms. Possible fixes: skip the catalog query for
    relations we don't need (snapshot only what `pg_relation_filepath` returns
-   non-null for), use a connection pool, or merge into the `vkarious branch`
+   non-null for), use a connection pool, or merge into the `foldout branch`
    command so the connection is already open.
 
 2. **Hint bits and visibility writes.** Postgres can write to pages just to
@@ -202,6 +202,6 @@ Verification pass: re-run `hash_rust` on both sides post-merge.
 
 - `page_diff_v2.py` — Phase 0 (snapshot) + Phase 1 (find changed pages).
 - `notes.md` — hashing benchmarks (5 GB DB in ~9 s, 8 workers, LPT).
-- `src/vkarious/sql/change_capture.sql` — trigger-based alternative.
+- `src/foldout/sql/change_capture.sql` — trigger-based alternative.
 - `hash_rust/` — full-DB hashing, used as the verification step.
 - `vkapgx/pg_hashdb` — server-side per-table hasher; not on the hot path.
