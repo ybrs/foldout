@@ -8,16 +8,18 @@ import click
 
 from . import __version__
 from .db import (
+    ActiveConnectionsTimeout,
+    SourceHasActiveConnections,
     connect,
     copy_database_files,
     create_base_database,
     create_branch_database,
     create_snapshot_database,
     database_exists,
-    database_write_lock,
     delete_database_record,
     drop_base_for_branch,
     drop_database,
+    format_connection_table,
     get_branch_base,
     get_branch_parent,
     get_branch_parent_snapshot_path,
@@ -30,13 +32,13 @@ from .db import (
     get_snapshot_record,
     initialize_database,
     list_databases,
+    lock_source_database,
     log_branch_operation,
     register_base_database,
     register_branch_database,
     register_snapshot_database,
     register_source_database,
     restore_database_from_snapshot,
-    should_use_native_clone,
 )
 from .change_capture import ChangeCaptureInstaller
 from . import page_diff
@@ -46,6 +48,42 @@ def run_command(command: list[str]) -> None:
     """Run a shell command and echo its output."""
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     click.echo(result.stdout.strip())
+
+
+def _report_active_connections_and_exit(exc: SourceHasActiveConnections) -> None:
+    """Format a SourceHasActiveConnections for the user and abort cleanly.
+
+    Always exits via `click.ClickException` so the caller can convert the
+    raise into a non-zero exit code without losing the formatted body.
+    """
+    click.secho(
+        f"\nERROR: '{exc.database_name}' has {len(exc.connections)} "
+        f"active connection(s); cannot snapshot/branch safely.",
+        fg="red", bold=True, err=True,
+    )
+    click.echo(format_connection_table(exc.connections), err=True)
+    click.echo(
+        "\nClose them yourself, or re-run with --force to terminate them.",
+        err=True,
+    )
+    raise click.ClickException(
+        f"refused: {len(exc.connections)} active connection(s) on "
+        f"'{exc.database_name}'"
+    )
+
+
+def _report_termination_timeout_and_exit(exc: ActiveConnectionsTimeout) -> None:
+    """Format an ActiveConnectionsTimeout for the user and abort cleanly."""
+    click.secho(
+        f"\nERROR: pg_terminate_backend ran on '{exc.database_name}' but "
+        f"{len(exc.connections)} connection(s) are still attached after "
+        f"{exc.timeout_s}s.",
+        fg="red", bold=True, err=True,
+    )
+    click.echo(format_connection_table(exc.connections), err=True)
+    raise click.ClickException(
+        f"refused: backends on '{exc.database_name}' did not terminate"
+    )
 
 
 def _probe_clone_strategy() -> bool:
@@ -90,7 +128,11 @@ def cli() -> None:
 @cli.command()
 @click.argument("database_name")
 @click.argument("branch_name")
-def branch(database_name: str, branch_name: str) -> None:
+@click.option("--force", is_flag=True,
+              help="Terminate any active connections to DATABASE_NAME "
+                   "before branching. Without --force, foldout refuses "
+                   "to branch a database with active connections.")
+def branch(database_name: str, branch_name: str, force: bool) -> None:
     """Create a branch of DATABASE_NAME with the given BRANCH_NAME."""
     try:
         click.echo(f"Creating branch '{branch_name}' of database '{database_name}'...")
@@ -116,46 +158,61 @@ def branch(database_name: str, branch_name: str) -> None:
         data_directory = get_data_directory()
         click.echo(f"PostgreSQL data directory: {data_directory}")
 
-        if use_native_clone:
-            # PG clones the source itself for both target and base.
-            branch_database_name, target_oid = create_branch_database(
-                database_name, branch_name, template=database_name,
-            )
-            click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
+        # Take the source lock once for the whole branch operation. Both
+        # the native-clone and manual-cp paths run under it; the parent
+        # page-diff snapshot is recorded under the same lock so its
+        # (size, mtime) values match what was just cloned.
+        try:
+            with lock_source_database(database_name, force=force):
+                click.echo(f"Locked source database '{database_name}' for branch")
+                if use_native_clone:
+                    branch_database_name, target_oid = create_branch_database(
+                        database_name, branch_name, template=database_name,
+                    )
+                    click.echo(
+                        f"Created branch database '{branch_database_name}' "
+                        f"with OID: {target_oid}"
+                    )
 
-            base_database_name, base_oid = create_base_database(
-                database_name, branch_name, template=database_name,
-            )
-            click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
+                    base_database_name, base_oid = create_base_database(
+                        database_name, branch_name, template=database_name,
+                    )
+                    click.echo(
+                        f"Created base snapshot '{base_database_name}' "
+                        f"with OID: {base_oid}"
+                    )
 
-            click.echo("Branch and base files cloned by PostgreSQL (no manual copy)")
-            # The parent page-diff snapshot only reads stat() values on the
-            # source's files, but we keep it under a brief lock so the
-            # recorded (size, mtime) matches what was just cloned.
-            with database_write_lock(database_name):
+                    click.echo("Branch and base files cloned by PostgreSQL (no manual copy)")
+                else:
+                    branch_database_name, target_oid = create_branch_database(
+                        database_name, branch_name
+                    )
+                    click.echo(
+                        f"Created branch database '{branch_database_name}' "
+                        f"with OID: {target_oid}"
+                    )
+
+                    base_database_name, base_oid = create_base_database(
+                        database_name, branch_name
+                    )
+                    click.echo(
+                        f"Created base snapshot '{base_database_name}' "
+                        f"with OID: {base_oid}"
+                    )
+
+                    copy_database_files(data_directory, source_oid, target_oid)
+                    click.echo("Database files copied successfully")
+
+                    copy_database_files(data_directory, source_oid, base_oid)
+                    click.echo("Base snapshot files copied successfully")
+
                 parent_snap_path = get_branch_parent_snapshot_path(target_oid)
                 page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
                 click.echo(f"Saved parent snapshot: {parent_snap_path}")
-        else:
-            # Empty FILE_COPY DBs, then overwrite both with manual reflink cps.
-            branch_database_name, target_oid = create_branch_database(database_name, branch_name)
-            click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
-
-            base_database_name, base_oid = create_base_database(database_name, branch_name)
-            click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
-
-            with database_write_lock(database_name):
-                click.echo(f"Acquired write lock on database '{database_name}'")
-
-                copy_database_files(data_directory, source_oid, target_oid)
-                click.echo("Database files copied successfully")
-
-                copy_database_files(data_directory, source_oid, base_oid)
-                click.echo("Base snapshot files copied successfully")
-
-                parent_snap_path = get_branch_parent_snapshot_path(target_oid)
-                page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
-                click.echo(f"Saved parent snapshot: {parent_snap_path}")
+        except SourceHasActiveConnections as exc:
+            _report_active_connections_and_exit(exc)
+        except ActiveConnectionsTimeout as exc:
+            _report_termination_timeout_and_exit(exc)
 
         # Ensure change-capture is present on the new branch database as well
         if installer.ensure_installed(branch_database_name):
@@ -182,7 +239,9 @@ def branch(database_name: str, branch_name: str) -> None:
         click.echo(f"Saved page-diff snapshot: {snap_path}")
 
         click.echo(f"Branch completed successfully: {branch_database_name}")
-        
+
+    except click.ClickException:
+        raise
     except Exception as e:
         click.echo(f"Error creating branch: {e}", err=True)
         raise click.ClickException(str(e))
@@ -190,7 +249,11 @@ def branch(database_name: str, branch_name: str) -> None:
 
 @cli.command()
 @click.argument("database_name")
-def snapshot(database_name: str) -> None:
+@click.option("--force", is_flag=True,
+              help="Terminate any active connections to DATABASE_NAME "
+                   "before snapshotting. Without --force, foldout refuses "
+                   "to snapshot a database with active connections.")
+def snapshot(database_name: str, force: bool) -> None:
     """Create a snapshot of DATABASE_NAME."""
     try:
         click.echo(f"Creating snapshot of database '{database_name}'...")
@@ -210,23 +273,34 @@ def snapshot(database_name: str) -> None:
         data_directory = get_data_directory()
         click.echo(f"PostgreSQL data directory: {data_directory}")
 
-        if use_native_clone:
-            # PG clones source itself. CREATE DATABASE ... TEMPLATE source
-            # locks out new connections to the source until it finishes and
-            # fails if any other backend is already connected.
-            snapshot_name, target_oid = create_snapshot_database(
-                database_name, template=database_name,
-            )
-            click.echo(f"Created snapshot database '{snapshot_name}' with OID: {target_oid}")
-            click.echo("Database files cloned by PostgreSQL (no manual copy)")
-        else:
-            # Empty FILE_COPY DB, then overwrite with manual reflink cp.
-            snapshot_name, target_oid = create_snapshot_database(database_name)
-            click.echo(f"Created snapshot database '{snapshot_name}' with OID: {target_oid}")
-            with database_write_lock(database_name):
-                click.echo(f"Acquired write lock on database '{database_name}'")
-                copy_database_files(data_directory, source_oid, target_oid)
-                click.echo("Database files copied successfully")
+        # Take the database lock for both paths. PG's native CREATE
+        # DATABASE ... TEMPLATE also needs no concurrent connections to
+        # source, so the lock is useful even on the native-clone path —
+        # and it gives us the same --force UX everywhere.
+        try:
+            with lock_source_database(database_name, force=force):
+                click.echo(f"Locked source database '{database_name}' for snapshot")
+                if use_native_clone:
+                    snapshot_name, target_oid = create_snapshot_database(
+                        database_name, template=database_name,
+                    )
+                    click.echo(
+                        f"Created snapshot database '{snapshot_name}' "
+                        f"with OID: {target_oid}"
+                    )
+                    click.echo("Database files cloned by PostgreSQL (no manual copy)")
+                else:
+                    snapshot_name, target_oid = create_snapshot_database(database_name)
+                    click.echo(
+                        f"Created snapshot database '{snapshot_name}' "
+                        f"with OID: {target_oid}"
+                    )
+                    copy_database_files(data_directory, source_oid, target_oid)
+                    click.echo("Database files copied successfully")
+        except SourceHasActiveConnections as exc:
+            _report_active_connections_and_exit(exc)
+        except ActiveConnectionsTimeout as exc:
+            _report_termination_timeout_and_exit(exc)
 
         # Register snapshot database in fld_databases table
         register_snapshot_database(snapshot_name, target_oid, source_oid)
@@ -234,6 +308,8 @@ def snapshot(database_name: str) -> None:
 
         click.echo(f"Snapshot completed successfully: {snapshot_name}")
 
+    except click.ClickException:
+        raise
     except Exception as e:
         click.echo(f"Error creating snapshot: {e}", err=True)
         raise click.ClickException(str(e))

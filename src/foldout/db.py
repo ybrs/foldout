@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import re
@@ -13,6 +14,11 @@ from pathlib import Path
 from typing import Iterator
 
 import psycopg
+
+from .helpers import pick
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_database_dsn() -> str:
@@ -35,7 +41,7 @@ def list_databases() -> list[dict[str, str | int]]:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT oid, datname FROM pg_database ORDER BY datname")
-            return [{"oid": row[0], "name": row[1]} for row in cur.fetchall()]
+            return pick(cur.fetchall(), "oid", "name")
 
 
 def get_data_directory() -> str:
@@ -112,7 +118,13 @@ def get_branch_parent_snapshot_path(branch_oid: int) -> Path:
 
 
 def terminate_database_connections(database_name: str) -> int:
-    """Terminate all connections to a database except the current one."""
+    """Terminate all connections to a database except the current one.
+
+    Returns the number of backends `pg_terminate_backend` was called
+    against. Termination is asynchronous on the server side — callers
+    that need to know when the backends are actually gone should follow
+    up with `wait_for_no_connections()`.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -125,39 +137,224 @@ def terminate_database_connections(database_name: str) -> int:
             return terminated_count
 
 
-@contextmanager
-def database_write_lock(database_name: str) -> Iterator[None]:
-    """Context manager to acquire an exclusive lock on a database to prevent writes."""
-    # Connect to the specific database to lock it
-    db_dsn = get_database_dsn()
-    # Parse DSN and modify it to connect to the target database
-    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = database_name
-    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
-    
-    conn = psycopg.connect(target_dsn)
-    try:
-        with conn.cursor() as cur:
-            # First terminate existing connections
-            # terminate_database_connections(database_name)
-            print("checkpoint")
-            cur.execute("CHECKPOINT")
+class ActiveConnection:
+    """Snapshot of one row from `pg_stat_activity` for human display.
 
-            time.sleep(1)  # Brief pause to ensure connections are terminated
-            
-            # Acquire an advisory lock
-            cur.execute("SELECT pg_advisory_lock(12345)")
-            conn.commit()
-            
+    We use a plain class (not a dataclass) so the rendering helpers
+    `__str__` / `format_table` can live on it and so callers can rely on
+    these specific attribute names when formatting error messages.
+    """
+
+    def __init__(self, pid: int, application_name: str, state: str,
+                 client_addr: str | None, query: str) -> None:
+        """Build a record. All fields are stringified for stable output."""
+        self.pid = pid
+        self.application_name = application_name or ""
+        self.state = state or ""
+        self.client_addr = client_addr or ""
+        self.query = query or ""
+
+    def __repr__(self) -> str:
+        """Compact repr for assertion messages."""
+        return (
+            f"ActiveConnection(pid={self.pid}, app={self.application_name!r}, "
+            f"state={self.state!r})"
+        )
+
+
+def format_connection_table(connections: list[ActiveConnection]) -> str:
+    """Render a list of `ActiveConnection`s as a multi-line aligned table."""
+    if not connections:
+        return "  (no active connections)"
+    lines: list[str] = []
+    lines.append(
+        f"  {'pid':<8}{'app':<24}{'state':<22}{'client':<18}query"
+    )
+    lines.append("  " + "-" * 90)
+    for conn in connections:
+        # Truncate the query to keep the table readable but still useful.
+        query_preview = conn.query.replace("\n", " ").strip()
+        if len(query_preview) > 80:
+            query_preview = query_preview[:77] + "..."
+        lines.append(
+            f"  {conn.pid:<8}{conn.application_name[:22]:<24}"
+            f"{conn.state[:20]:<22}{conn.client_addr[:16]:<18}"
+            f"{query_preview}"
+        )
+    return "\n".join(lines)
+
+
+class SourceHasActiveConnections(RuntimeError):
+    """Raised when a snapshot/branch is blocked by existing connections.
+
+    Carries the full connection list so the CLI layer can format a
+    detailed error message without re-querying.
+    """
+
+    def __init__(self, database_name: str,
+                 connections: list[ActiveConnection]) -> None:
+        """Build with the source DB name and the list of active backends."""
+        self.database_name = database_name
+        self.connections = connections
+        super().__init__(
+            f"{len(connections)} active connection(s) to '{database_name}'"
+        )
+
+
+class ActiveConnectionsTimeout(RuntimeError):
+    """Raised when pg_terminate_backend doesn't drain backends in time.
+
+    Indicates either a stuck backend (e.g. a buggy extension ignoring
+    SIGTERM) or a wait timeout set too low. Carries the still-connected
+    list at the moment we gave up.
+    """
+
+    def __init__(self, database_name: str,
+                 connections: list[ActiveConnection],
+                 timeout_s: float) -> None:
+        """Build with source DB name, the remaining connections, and the timeout used."""
+        self.database_name = database_name
+        self.connections = connections
+        self.timeout_s = timeout_s
+        super().__init__(
+            f"{len(connections)} connection(s) still attached to "
+            f"'{database_name}' after {timeout_s}s"
+        )
+
+
+def _connect_postgres_db() -> psycopg.Connection:
+    """Open a connection to the maintenance `postgres` database.
+
+    Used by the lock plumbing — `ALTER DATABASE ... ALLOW_CONNECTIONS`
+    can't be run on the database it's altering, so we connect via the
+    cluster's bootstrap DB.
+    """
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params["dbname"] = "postgres"
+    return psycopg.connect(psycopg.conninfo.make_conninfo(**conn_params))
+
+
+def get_active_connections(database_name: str) -> list[ActiveConnection]:
+    """Return the non-self backends currently connected to `database_name`."""
+    out: list[ActiveConnection] = []
+    with _connect_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pid, application_name, state, client_addr::text, query
+                FROM pg_stat_activity
+                WHERE datname = %s AND pid <> pg_backend_pid()
+                ORDER BY pid
+                """,
+                (database_name,),
+            )
+            for row in cur.fetchall():
+                out.append(
+                    ActiveConnection(
+                        pid=int(row[0]),
+                        application_name=row[1],
+                        state=row[2],
+                        client_addr=row[3],
+                        query=row[4],
+                    )
+                )
+    return out
+
+
+def alter_database_allow_connections(database_name: str, allow: bool) -> None:
+    """Toggle `pg_database.datallowconn` for `database_name`.
+
+    When `allow=False`, new connection attempts to this database are
+    rejected by PG with "database X is not currently accepting
+    connections". Existing connections continue normally.
+    """
+    sql = (
+        f'ALTER DATABASE "{database_name}" '
+        f'WITH ALLOW_CONNECTIONS {"true" if allow else "false"}'
+    )
+    with _connect_postgres_db() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql)
+
+
+def wait_for_no_connections(database_name: str,
+                            timeout_s: float = 10.0,
+                            poll_interval_s: float = 0.1) -> None:
+    """Poll until `database_name` has no non-self backends, or timeout.
+
+    Used after `pg_terminate_backend` since termination is asynchronous
+    on the server side. Raises `ActiveConnectionsTimeout` with the
+    remaining connection list if the wait expires.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = get_active_connections(database_name)
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            raise ActiveConnectionsTimeout(database_name, remaining, timeout_s)
+        time.sleep(poll_interval_s)
+
+
+@contextmanager
+def lock_source_database(database_name: str,
+                         force: bool = False,
+                         wait_timeout_s: float = 10.0) -> Iterator[None]:
+    """Acquire an exclusive lock on `database_name` for the duration.
+
+    Sequence (lock first, then check — eliminates the race window where
+    a client could connect between the check and the snapshot copy):
+
+    1. `ALTER DATABASE ... ALLOW_CONNECTIONS false` (reject new connections).
+    2. Query `pg_stat_activity` for non-self backends.
+    3. - Empty → CHECKPOINT, yield.
+       - Non-empty + `force=False` → raise `SourceHasActiveConnections`.
+       - Non-empty + `force=True` → `pg_terminate_backend` each,
+         `wait_for_no_connections` (raises `ActiveConnectionsTimeout`
+         on timeout), CHECKPOINT, yield.
+
+    A `try / finally` restores `ALLOW_CONNECTIONS true` on every exit
+    path including exceptions. The one unrecoverable case is the Python
+    process being `kill -9`'d between lock and unlock — see TASKS.md for
+    the manual recovery one-liner.
+
+    Args:
+        database_name: The source database to lock.
+        force: If True, terminate existing connections instead of failing.
+        wait_timeout_s: How long to wait for terminated backends to drop.
+    """
+    alter_database_allow_connections(database_name, allow=False)
+    try:
+        connections = get_active_connections(database_name)
+        if connections:
+            if not force:
+                raise SourceHasActiveConnections(database_name, connections)
+            logger.info(
+                "Terminating %d connection(s) on '%s' (--force)",
+                len(connections), database_name,
+            )
+            terminate_database_connections(database_name)
+            wait_for_no_connections(database_name, timeout_s=wait_timeout_s)
+        # CHECKPOINT flushes dirty buffers to PGDATA files. Cluster-wide,
+        # so it doesn't need to run on the locked DB itself.
+        with _connect_postgres_db() as conn:
+            with conn.cursor() as cur:
+                logger.debug("CHECKPOINT before snapshot of %s", database_name)
+                cur.execute("CHECKPOINT")
         yield
     finally:
-        with conn.cursor() as cur:
-            # Release the advisory lock
-            cur.execute("SELECT pg_advisory_unlock(12345)")
-            conn.commit()
-        conn.close()
+        alter_database_allow_connections(database_name, allow=True)
 
 def get_pg_major_version(conn) -> int:
+    """Return the major version (e.g. `17`, `18`) of the connected server.
+
+    Used to gate version-specific SQL — STRATEGY=FILE_COPY requires PG 15+,
+    file_copy_method requires PG 18+, etc. Reads `server_version` (the
+    human-readable form like `'17.5 (Debian 17.5-1.pgdg120+1)'`) and
+    takes the leading integer.
+    """
     with conn.cursor() as cur:
         cur.execute("SHOW server_version")
         version_str = cur.fetchone()[0]
@@ -446,12 +643,20 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
                 check=True, capture_output=True, text=True,
             )
 
-    # Remove pg_internal.init file from the copied directory
+    # Remove pg_internal.init file from the copied directory. It's
+    # regenerated on first connection from the relmap files; carrying a
+    # stale copy across a clone can confuse the new database. The file is
+    # normally present in a live PGDATA but may legitimately be missing
+    # right after `CREATE DATABASE STRATEGY=FILE_COPY` (PG hasn't started
+    # the new DB yet to populate it).
     pg_internal_init = target_path / "pg_internal.init"
     if pg_internal_init.exists():
         pg_internal_init.unlink()
     else:
-        print("no internal file ?")
+        logger.debug(
+            "pg_internal.init not present in cloned target %s (normal for "
+            "a freshly-created FILE_COPY target)", target_path,
+        )
 
 
 def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> dict:
@@ -504,10 +709,26 @@ def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> di
         with connect() as conn:
             use_native = should_use_native_clone(conn)
 
-        # Safety: terminate connections and briefly lock during filesystem move
+        # Safety: terminate connections, wait for them to actually drop,
+        # then CHECKPOINT before moving files. Restore is destructive by
+        # nature so we kill connections unconditionally (no --force gate);
+        # the user knows they're rebuilding the database.
         terminate_database_connections(database_name)
-        with database_write_lock(database_name):
-            subprocess.run(["mv", str(source_path), str(backup_path)], check=True, capture_output=True, text=True)
+        try:
+            wait_for_no_connections(database_name, timeout_s=10.0)
+        except ActiveConnectionsTimeout as exc:
+            raise RuntimeError(
+                f"could not terminate connections to '{database_name}' "
+                f"before restore: {len(exc.connections)} still attached "
+                f"after {exc.timeout_s}s"
+            ) from exc
+        with _connect_postgres_db() as ckpt_conn:
+            with ckpt_conn.cursor() as ckpt_cur:
+                ckpt_cur.execute("CHECKPOINT")
+        subprocess.run(
+            ["mv", str(source_path), str(backup_path)],
+            check=True, capture_output=True, text=True,
+        )
 
         # Drop and recreate the database. On PG 18+clone, we recreate it
         # directly from the snapshot via TEMPLATE — PG handles the reflinks.

@@ -209,3 +209,5 @@ __marimo__/
 # foldout integration test artifacts
 .test-cache/
 .test-data/
+.test-harness-data/
+.test-harness.json

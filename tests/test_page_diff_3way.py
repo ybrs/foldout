@@ -544,7 +544,11 @@ try:
         """
         return _server_pgdata()
 
-    @pytest.mark.parametrize("scenario", SCENARIOS, ids=[s.name for s in SCENARIOS])
+    def _scenario_id(scenario):
+        """Render a pytest parametrize id from a Scenario3way object."""
+        return scenario.name
+
+    @pytest.mark.parametrize("scenario", SCENARIOS, ids=_scenario_id)
     def test_3way_scenario(scenario, pgdata):
         scenario.run(pgdata)
 except ImportError:

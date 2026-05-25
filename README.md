@@ -46,6 +46,13 @@ Restore from a snapshot:
 foldout snapshots restore database_name snapshot_name
 ```
 
+> **Warning:** `restore` is destructive — it drops the existing database and
+> rebuilds it from the snapshot's files. Any active connection to
+> `database_name` is **terminated** as part of the restore (you are
+> explicitly destroying the database, so foldout doesn't ask first). Move
+> the original PGDATA aside as `fld_delete_<oid>_<timestamp>` for manual
+> recovery if needed.
+
 Delete a snapshot:
 ```bash
 foldout snapshots delete snapshot_name

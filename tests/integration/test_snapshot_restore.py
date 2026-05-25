@@ -1,6 +1,6 @@
 """End-to-end test: source DB -> foldout snapshot -> mutate -> restore.
 
-Runs once per major in the matrix (PG 16, PG 17 today). Verifies that:
+Runs once per major in the matrix (PG 16, 17, 18). Verifies that:
 - foldout's CLI can drive a live cluster
 - the COW copy (`cp --reflink=always` on btrfs) succeeds
 - a restore brings the source back to the snapshot's row contents
@@ -8,7 +8,6 @@ Runs once per major in the matrix (PG 16, PG 17 today). Verifies that:
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -29,6 +28,7 @@ SOURCE_DB = "appdb"
 
 
 def _seed_source(cluster: PgCluster) -> None:
+    """Create SOURCE_DB on `cluster` and populate it with a tiny `items` table."""
     cluster.create_database(SOURCE_DB)
     cluster.psql(
         "CREATE TABLE items (id int primary key, label text); "
@@ -37,14 +37,8 @@ def _seed_source(cluster: PgCluster) -> None:
     )
 
 
-def _row_count(cluster: PgCluster, database: str) -> int:
-    with psycopg.connect(cluster.dsn(database=database)) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM items")
-            return int(cur.fetchone()[0])
-
-
 def _labels(cluster: PgCluster, database: str) -> list[str]:
+    """Return the `label` column of `items` from `database`, ordered by id."""
     with psycopg.connect(cluster.dsn(database=database)) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT label FROM items ORDER BY id")
@@ -55,6 +49,7 @@ def _labels(cluster: PgCluster, database: str) -> list[str]:
 
 
 def _parse_snapshot_name(cli_output: str) -> str:
+    """Extract the snapshot DB name from `foldout snapshot`'s stdout."""
     match = re.search(r"Created snapshot database '([^']+)'", cli_output)
     if match is None:
         raise AssertionError(
@@ -130,13 +125,17 @@ def _unshared_bytes(src_file: Path, snap_file: Path) -> int:
 
 
 def _pick_largest_relation(db_dir: Path) -> Path:
+    """Return the largest numeric-named relation file in a PG database dir.
+
+    Relation files are named by relfilenode (digits only); pg_filenode.map
+    and pg_internal.init are special and not always reflinked, so we skip
+    them. The biggest relation gives us the strongest extent-sharing signal.
+    """
     largest: Path | None = None
     largest_size = -1
     for entry in db_dir.iterdir():
         if not entry.is_file():
             continue
-        # Numeric filenames are relations; pg_filenode.map / pg_internal.init
-        # are special and not always reflinked.
         if not entry.name.isdigit():
             continue
         size = entry.stat().st_size
@@ -148,12 +147,9 @@ def _pick_largest_relation(db_dir: Path) -> Path:
     return largest
 
 
-def test_snapshot_then_restore(foldout_env: PgCluster,
-                               tmp_path: Path,
-                               monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_then_restore(foldout_env: PgCluster) -> None:
+    """foldout snapshot → mutate source → foldout restore → original rows back."""
     cluster = foldout_env
-    # Isolate ~/.foldout per test run so snapshot json files don't leak.
-    monkeypatch.setenv("HOME", str(tmp_path))
 
     _seed_source(cluster)
     assert _labels(cluster, SOURCE_DB) == ["one", "two", "three"]
@@ -196,13 +192,14 @@ def test_filesystem_cow_probe_detects_btrfs(foldout_env: PgCluster) -> None:
 
 
 def test_snapshot_uses_reflinks(foldout_env: PgCluster,
-                                tmp_path: Path,
                                 monkeypatch: pytest.MonkeyPatch) -> None:
     """Strict-COW snapshot must succeed AND share extents with the source.
 
     Three independent checks:
-      1. `FLD_COW_STRICT=1` forces `cp --reflink=always` with no fallback.
-         A clean exit means the FS-level CoW path was taken.
+      1. `FLD_COW_STRICT=1` forces `cp --reflink=always` with no fallback
+         on the manual-cp paths (PG ≤ 17 and PG 18 with file_copy_method=copy).
+         On pg18-clone the env var is harmless — PG takes the native path
+         and `copy_database_files()` is never called.
       2. The largest relation file shares physical extents with the source
          (per-file proof that the copy was a reflink).
       3. The TOTAL bytes occupied by snapshot extents that are not shared
@@ -210,7 +207,6 @@ def test_snapshot_uses_reflinks(foldout_env: PgCluster,
          a full bytewise copy that would have duplicated megabytes/GBs.
     """
     cluster = foldout_env
-    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("FLD_COW_STRICT", "1")
 
     _seed_source(cluster)

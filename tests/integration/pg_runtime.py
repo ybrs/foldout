@@ -61,30 +61,37 @@ class PgBinary:
 
     @property
     def bin_dir(self) -> Path:
+        """Directory containing initdb, pg_ctl, postgres, psql, etc."""
         return self.install_dir / "bin"
 
     @property
     def lib_dir(self) -> Path:
+        """Directory containing the bundle's shared libraries."""
         return self.install_dir / "lib"
 
     @property
     def share_dir(self) -> Path:
+        """Directory containing initdb's `share/` data (timezone files, etc.)."""
         return self.install_dir / "share"
 
     @property
     def initdb(self) -> Path:
+        """Path to the `initdb` binary."""
         return self.bin_dir / "initdb"
 
     @property
     def pg_ctl(self) -> Path:
+        """Path to the `pg_ctl` binary."""
         return self.bin_dir / "pg_ctl"
 
     @property
     def postgres(self) -> Path:
+        """Path to the `postgres` server binary."""
         return self.bin_dir / "postgres"
 
     @property
     def psql(self) -> Path:
+        """Path to the `psql` client binary."""
         return self.bin_dir / "psql"
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -102,10 +109,17 @@ class PgBinaryManager:
     """Downloads and unpacks theseus-rs PG tarballs into a shared cache."""
 
     def __init__(self, cache_dir: Path = CACHE_DIR) -> None:
+        """Initialize the manager, creating the cache directory if missing.
+
+        Args:
+            cache_dir: Where to keep downloaded tarballs and extracted
+                bundles. Defaults to `<repo>/.test-cache/pg-binaries/`.
+        """
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def url_for(self, full_version: str) -> str:
+        """Return the GitHub release URL for a theseus-rs PG tarball."""
         triple = _platform_triple()
         return (
             "https://github.com/theseus-rs/postgresql-binaries/releases/download/"
@@ -113,9 +127,11 @@ class PgBinaryManager:
         )
 
     def tarball_path(self, full_version: str) -> Path:
+        """Return the on-disk path where a given version's tarball is cached."""
         return self.cache_dir / f"postgresql-{full_version}.tar.gz"
 
     def install_dir(self, full_version: str) -> Path:
+        """Return the on-disk path where the extracted bundle lives."""
         return self.cache_dir / f"postgresql-{full_version}"
 
     def ensure(self, major: int) -> PgBinary:
@@ -158,7 +174,11 @@ class PgBinaryManager:
             subprocess.run(["rm", "-rf", str(staging)], check=True)
         staging.mkdir(parents=True)
         with tarfile.open(tarball, "r:gz") as tf:
-            tf.extractall(staging)
+            # filter='data' (PEP 706, Python 3.12+) rejects path-traversal
+            # entries, absolute paths, symlinks pointing outside the
+            # extraction dir, and device/fifo entries. The theseus-rs
+            # tarballs are trusted, but this is free defense in depth.
+            tf.extractall(staging, filter="data")
         # The tarball top-level is a single directory; flatten it.
         entries = list(staging.iterdir())
         if len(entries) == 1 and entries[0].is_dir():
