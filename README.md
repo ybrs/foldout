@@ -135,6 +135,56 @@ from *"parent removed X"* — both look identical when you only compare
 branch vs. parent right now. With `BASE` as the merge base, every
 difference is attributed to exactly one side, just like in `git merge`.
 
+### Why two-way isn't enough — a worked example
+
+Say you branch `main` into `feat1`. At branch time both look like this:
+
+| users.id | name   |
+|---------:|--------|
+|        1 | alice  |
+
+Then two things happen, in parallel and independently of each other:
+
+- On `main`, a teammate inserts `(2, 'mary')`.
+- On `feat1`, you insert `(3, 'bob')`.
+
+Now you want to merge `feat1` back into `main`. A plain **two-way diff**
+just compares the branch to main as they stand right now:
+
+- `feat1` has rows 1 and 3.
+- `main` has rows 1 and 2.
+
+So it would emit:
+
+```sql
+INSERT INTO users VALUES (3, 'bob');    -- correct: branch added bob
+DELETE FROM users WHERE id = 2;         -- WRONG: that's mary, main added her
+```
+
+The two-way diff has no way to tell that row 2 wasn't deleted on the
+branch — it was never on the branch in the first place. It just sees
+"main has a row that branch doesn't" and assumes the branch dropped
+it. Apply that, and you'd quietly delete mary.
+
+A **three-way diff** has the extra reference: `BASE`, the snapshot of
+`main` as it looked at branch time, which still only has row 1. Now
+each row has a clear story:
+
+- Row 3 is in `feat1`, not in `BASE` → branch added it → **INSERT**.
+- Row 2 is in `main`, not in `BASE`, not in `feat1` → main added it
+  on its own → **leave it alone** (reported as drift).
+- Row 1 is everywhere and unchanged → nothing to do.
+
+So foldout emits exactly:
+
+```sql
+INSERT INTO users VALUES (3, 'bob');
+```
+
+and mary stays put. That's the whole point of 3-way diffing: a
+difference between `main` and the branch only matters if it didn't
+already exist when the branch started.
+
 ### How we get BASE — instant, free, queryable
 
 When you run `foldout branch main feat1`, foldout takes **two** COW
