@@ -243,7 +243,7 @@ for v1).
 |---|---:|---|
 | `tests/test_schema_3way.py` | 9 | unit-level 3-way merge matrix (no Postgres) |
 | `tests/test_page_diff.py`   | 24 | e2e for `cross_diff()` (2-way path; regression safety) |
-| `tests/test_page_diff_3way.py` | 12 | e2e for `cross_diff_3way()` — parent-drift, both-sides changes, conflicts, deletes |
+| `tests/test_page_diff_3way.py` | 18 | e2e for `cross_diff_3way()` — parent-drift, both-sides changes, conflicts, deletes, **no-PK multiset 3-way** |
 | `tests/test_cli_diff.py`    | 9 | full CLI path: `vka branch` + `fld diff` + `--apply` + exit codes + base lifecycle + 2-way fallback hardening |
 
 CLI test scenarios:
@@ -260,16 +260,36 @@ CLI test scenarios:
 
 ### Remaining
 
-- ❌ **No-PK 3-way support.** Currently `cross_diff_3way()` skips
-  tables without a primary key. 2-way has a multiset fallback;
-  3-way needs the same idea extended with base as a reference.
-  Design and scope: see `NEXT-STEPS.md` section 2.
+- ✅ **No-PK 3-way support.** Implemented in `cross_diff_3way()` using
+  multiset deltas: for each distinct row R on changed pages,
+  `bD = count(R in branch's changed pages) - count(R in base's same
+  pages)` and `mD = count(R in main's changed pages) - count(R in
+  base's same pages)`. Matrix:
+  - `bD=0, mD=0` → skip
+  - `bD=0, mD≠0` → drift (kind `row_no_pk`)
+  - `bD≠0, mD=0` → apply branch's intent
+  - same sign → apply branch's "extra" (`max(0, |bD|−|mD|)`)
+  - opposite signs → conflict (kind `row_no_pk`)
+
+  No-PK tables that also have a column ADDed on branch are recorded as
+  drift (`no_pk_with_added_columns`) and skipped — that combo is
+  deferred.
+
+  Tests in `tests/test_page_diff_3way.py`:
+  - `no-pk-branch-inserts-parent-untouched`
+  - `no-pk-branch-deletes-parent-untouched`
+  - `no-pk-both-insert-different-rows`
+  - `no-pk-both-delete-same-row`
+  - `no-pk-branch-inserts-parent-deletes-conflict`
+  - `no-pk-duplicate-row-handling`
 
 ### Deferred (not needed for v1)
 
 - Three-way diff for views/functions at body-text level. Currently we
   emit DROP+CREATE on any body difference; "both rewrote the same
   function" appears as a conflict only if both versions differ.
+- No-PK tables that also have `ADD COLUMN` on branch — currently
+  surfaced as a `no_pk_with_added_columns` drift and skipped.
 - Auto-rebase ("pull main's drift into the branch first, then diff").
 - Conflict resolution flags (`--ours` / `--theirs`).
 - A `vka rebranch <branch>` convenience command (today: drop + branch).

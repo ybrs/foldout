@@ -414,6 +414,99 @@ SCENARIOS = [
         branch_mutate_sql=["DELETE FROM u WHERE id = 1"],
         expected_counts={"INSERT": 0, "UPDATE": 0, "DELETE": 0},
     ),
+
+    # ---------- no-PK 3-way scenarios ----------
+
+    # Branch inserts a row, parent untouched → INSERT applied to parent.
+    Scenario3way(
+        name="no-pk-branch-inserts-parent-untouched",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+            "INSERT INTO log VALUES ('initial')",
+        ],
+        parent_mutate_sql=[],
+        branch_mutate_sql=["INSERT INTO log VALUES ('branch-new')"],
+        expected_counts={"INSERT": 1, "DELETE": 0},
+    ),
+
+    # Branch deletes one of two duplicate rows, parent untouched → DELETE 1.
+    Scenario3way(
+        name="no-pk-branch-deletes-parent-untouched",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+            "INSERT INTO log VALUES ('a'),('a'),('b')",
+        ],
+        parent_mutate_sql=[],
+        branch_mutate_sql=[
+            "DELETE FROM log WHERE ctid = "
+            "(SELECT ctid FROM log WHERE msg = 'a' LIMIT 1)",
+        ],
+        expected_counts={"INSERT": 0, "DELETE": 1},
+    ),
+
+    # Branch inserts row X, parent inserts a different row Y → INSERT X
+    # applied to parent; Y is reported as drift.
+    Scenario3way(
+        name="no-pk-both-insert-different-rows",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+        ],
+        parent_mutate_sql=["INSERT INTO log VALUES ('main-row')"],
+        branch_mutate_sql=["INSERT INTO log VALUES ('branch-row')"],
+        expected_counts={"INSERT": 1, "DELETE": 0},
+        expect_drift_kinds=["row_no_pk"],
+    ),
+
+    # Both sides delete the same row → no SQL emitted; both agree.
+    Scenario3way(
+        name="no-pk-both-delete-same-row",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+            "INSERT INTO log VALUES ('shared')",
+        ],
+        parent_mutate_sql=[
+            "DELETE FROM log WHERE ctid = "
+            "(SELECT ctid FROM log WHERE msg = 'shared' LIMIT 1)",
+        ],
+        branch_mutate_sql=[
+            "DELETE FROM log WHERE ctid = "
+            "(SELECT ctid FROM log WHERE msg = 'shared' LIMIT 1)",
+        ],
+        expected_counts={"INSERT": 0, "DELETE": 0},
+    ),
+
+    # Branch INSERTs another copy of row R, parent DELETEs the existing R
+    # → opposite-direction deltas on the same row → CONFLICT.
+    Scenario3way(
+        name="no-pk-branch-inserts-parent-deletes-conflict",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+            "INSERT INTO log VALUES ('x')",
+        ],
+        parent_mutate_sql=[
+            "DELETE FROM log WHERE ctid = "
+            "(SELECT ctid FROM log WHERE msg = 'x' LIMIT 1)",
+        ],
+        branch_mutate_sql=["INSERT INTO log VALUES ('x')"],
+        expect_conflict_kinds=["row_no_pk"],
+        expect_converges=False,
+    ),
+
+    # Base has two duplicate copies of 'a'; branch deletes one; parent
+    # untouched → emit a single DELETE LIMIT 1; parent ends up with one copy.
+    Scenario3way(
+        name="no-pk-duplicate-row-handling",
+        setup_sql=[
+            "CREATE TABLE log (msg text)",
+            "INSERT INTO log VALUES ('a'),('a')",
+        ],
+        parent_mutate_sql=[],
+        branch_mutate_sql=[
+            "DELETE FROM log WHERE ctid = "
+            "(SELECT ctid FROM log WHERE msg = 'a' LIMIT 1)",
+        ],
+        expected_counts={"INSERT": 0, "DELETE": 1},
+    ),
 ]
 
 

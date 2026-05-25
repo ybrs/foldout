@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import pytest
 from click.testing import CliRunner
 
 import foldout.cli as cli_mod
@@ -81,6 +82,13 @@ def test_installer_installs_when_missing(monkeypatch) -> None:
     assert changed is True
 
 
+@pytest.mark.skip(
+    reason=(
+        "vka branch no longer wires change-capture / event triggers — "
+        "page-LSN diff superseded that path. Kept around because we may "
+        "revisit query/trigger capture for some use cases later."
+    )
+)
 def test_branch_wires_change_capture(monkeypatch) -> None:
     # Prepare a fake installer capturing the databases
     recorded: list[str] = []

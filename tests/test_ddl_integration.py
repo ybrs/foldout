@@ -209,6 +209,13 @@ def cleanup_test_databases() -> None:
         _test_databases.clear()
 
 
+@pytest.mark.skip(
+    reason=(
+        "DDL-logging-via-event-triggers is currently disabled — "
+        "page-LSN diff superseded it. Kept around because we may "
+        "revisit query/trigger capture for some use cases later."
+    )
+)
 def test_create_alter_table_logging():
     """
     Test that CREATE TABLE and ALTER TABLE commands are properly logged.
@@ -284,6 +291,13 @@ def test_create_alter_table_logging():
         raise
 
 
+@pytest.mark.skip(
+    reason=(
+        "DDL-logging-via-event-triggers is currently disabled — "
+        "page-LSN diff superseded it. Kept around because we may "
+        "revisit query/trigger capture for some use cases later."
+    )
+)
 def test_drop_table_logging():
     """
     Test that DROP TABLE commands are properly logged.
@@ -362,14 +376,28 @@ def test_drop_table_logging():
 
 
 # Pytest-compatible test functions
+@pytest.mark.skip(
+    reason=(
+        "DDL-logging-via-event-triggers is currently disabled — "
+        "page-LSN diff superseded it. Kept around because we may "
+        "revisit query/trigger capture for some use cases later."
+    )
+)
 def test_ddl_create_alter_logging():
     """Pytest wrapper for CREATE/ALTER TABLE logging test."""
     test_create_alter_table_logging()
     cleanup_test_databases()
 
 
+@pytest.mark.skip(
+    reason=(
+        "DDL-logging-via-event-triggers is currently disabled — "
+        "page-LSN diff superseded it. Kept around because we may "
+        "revisit query/trigger capture for some use cases later."
+    )
+)
 def test_ddl_drop_logging():
-    """Pytest wrapper for DROP TABLE logging test.""" 
+    """Pytest wrapper for DROP TABLE logging test."""
     test_drop_table_logging()
     cleanup_test_databases()
 
