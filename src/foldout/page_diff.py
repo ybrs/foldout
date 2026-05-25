@@ -1742,13 +1742,180 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
 
             pk_cols = get_pk_columns(cur_conn, oid)
             pk_names = [c[0] for c in pk_cols]
-            if not pk_names:
-                continue  # no-PK 3-way deferred
 
             main_types   = _table_column_types(main_schema, key)
             branch_types = _table_column_types(branch_schema, key)
             base_types   = _table_column_types(base_schema, key)
             added_for_this_tbl = added_cols_by_table.get(key, {})
+
+            if not pk_names:
+                # ---------- no-PK 3-way: multiset deltas ----------
+                # Per row R:
+                #   bD = count(R in branch's changed pages on branch) - count(R in base's same pages)
+                #   mD = count(R in main's changed pages on main)     - count(R in base's same pages)
+                # Matrix:
+                #   bD=0, mD=0          → skip
+                #   bD=0, mD!=0         → parent drift
+                #   bD!=0, mD=0         → apply branch's intent
+                #   same sign           → apply branch's "extra" (max(0, |bD|-|mD|))
+                #   opposite signs      → conflict
+                if added_for_this_tbl:
+                    drifts.append({
+                        "kind": "no_pk_with_added_columns",
+                        "key": key,
+                        "note": (
+                            "no-PK 3-way with ADDed columns is not supported; "
+                            "table skipped"
+                        ),
+                    })
+                    continue
+
+                branch_ctids = []
+                base_ctids_for_branch_blocks = []
+                for block, _lsn in branch_blocks:
+                    branch_ctids.extend(
+                        live_ctids_for_block(pgdata, current_relpath, block)
+                    )
+                    base_ctids_for_branch_blocks.extend(
+                        live_ctids_for_block(pgdata, base_relpath, block)
+                    )
+                main_ctids = []
+                base_ctids_for_main_blocks = []
+                for block, _lsn in main_blocks:
+                    main_ctids.extend(
+                        live_ctids_for_block(pgdata, main_relpath, block)
+                    )
+                    base_ctids_for_main_blocks.extend(
+                        live_ctids_for_block(pgdata, base_relpath, block)
+                    )
+
+                def fetch_data_rows(conn, types, ctids):
+                    if not ctids:
+                        return [], []
+                    cols_, rows_ = fetch_rows_for_ctids(
+                        conn, nsp, rel, ctids, types,
+                    )
+                    if not cols_:
+                        return [], []
+                    keep_idx = []
+                    for i, c in enumerate(cols_):
+                        if c != "ctid" and not c.startswith("__fld_diff_"):
+                            keep_idx.append(i)
+                    data_cols_ = [cols_[i] for i in keep_idx]
+                    data_rows_ = [tuple(r[i] for i in keep_idx) for r in rows_]
+                    return data_cols_, data_rows_
+
+                br_cols, br_rows = fetch_data_rows(
+                    cur_conn, branch_types, branch_ctids,
+                )
+                base_b_cols, base_b_rows = fetch_data_rows(
+                    base_conn, base_types, base_ctids_for_branch_blocks,
+                )
+                mn_cols, mn_rows = fetch_data_rows(
+                    src_conn, main_types, main_ctids,
+                )
+                base_m_cols, base_m_rows = fetch_data_rows(
+                    base_conn, base_types, base_ctids_for_main_blocks,
+                )
+
+                data_cols = (
+                    br_cols or base_b_cols or mn_cols or base_m_cols
+                )
+                if not data_cols:
+                    continue
+
+                branch_counter = Counter(br_rows)
+                main_counter = Counter(mn_rows)
+                base_b_counter = Counter(base_b_rows)
+                base_m_counter = Counter(base_m_rows)
+
+                distinct_rows = (
+                    set(branch_counter) | set(main_counter)
+                    | set(base_b_counter) | set(base_m_counter)
+                )
+
+                tbl_inserts = []
+                tbl_deletes = []
+                tbl_conflicts = []
+                for row in distinct_rows:
+                    bD = (
+                        branch_counter.get(row, 0)
+                        - base_b_counter.get(row, 0)
+                    )
+                    mD = (
+                        main_counter.get(row, 0)
+                        - base_m_counter.get(row, 0)
+                    )
+                    if bD == 0 and mD == 0:
+                        continue
+                    if bD == 0:
+                        drifts.append({
+                            "kind": "row_no_pk", "key": key,
+                            "main_delta": mD,
+                            "row": dict(zip(data_cols, row)),
+                        })
+                        continue
+                    if mD == 0:
+                        if bD > 0:
+                            for _ in range(bD):
+                                tbl_inserts.append(row)
+                        else:
+                            for _ in range(-bD):
+                                tbl_deletes.append(row)
+                        continue
+                    # both nonzero
+                    if (bD > 0) == (mD > 0):
+                        if bD > 0:
+                            extra = max(0, bD - mD)
+                            for _ in range(extra):
+                                tbl_inserts.append(row)
+                        else:
+                            extra = max(0, (-bD) - (-mD))
+                            for _ in range(extra):
+                                tbl_deletes.append(row)
+                        continue
+                    # opposite signs → conflict
+                    tbl_conflicts.append((row, bD, mD))
+
+                if tbl_conflicts:
+                    for row, bD, mD in tbl_conflicts:
+                        conflicts.append({
+                            "kind": "row_no_pk", "key": key,
+                            "branch_delta": bD, "main_delta": mD,
+                            "row": dict(zip(data_cols, row)),
+                        })
+                    continue
+
+                if not (tbl_inserts or tbl_deletes):
+                    continue
+
+                totals["rels_with_changes"] += 1
+                totals["INSERT"] += len(tbl_inserts)
+                totals["DELETE"] += len(tbl_deletes)
+                qn = f'"{nsp}"."{rel}"'
+                ins_types = branch_types or base_types
+                del_types = main_types or base_types
+                for row in tbl_inserts:
+                    cols_s = ", ".join(f'"{c}"' for c in data_cols)
+                    vals_s = ", ".join(
+                        _sql_text_literal(v, ins_types[c])
+                        for c, v in zip(data_cols, row)
+                    )
+                    sql_out.append(
+                        f"INSERT INTO {qn} ({cols_s}) VALUES ({vals_s});"
+                    )
+                for row in tbl_deletes:
+                    where_inner = " AND ".join(
+                        (f'"{c}" IS NULL' if v is None
+                         else f'"{c}"={_sql_text_literal(v, del_types[c])}')
+                        for c, v in zip(data_cols, row)
+                    )
+                    sql_out.append(
+                        f"DELETE FROM {qn} WHERE ctid = "
+                        f"(SELECT ctid FROM {qn} WHERE {where_inner} LIMIT 1);"
+                    )
+                continue
+            # ---------- end no-PK 3-way ----------
 
             # Candidate PK collection: read live ctids on changed pages from
             # BOTH the changed side AND base. This finds deleted PKs (still
