@@ -60,9 +60,18 @@ foldout version
 
 Show what changed on a branch (relative to its parent):
 ```bash
-foldout diff branch_name           # preview SQL only
-foldout diff branch_name --apply   # apply changes to the parent
+foldout diff branch_name                       # preview: SQL + conflicts + drift summary
+foldout diff branch_name --sql-only            # print just the SQL (script-friendly)
+foldout diff branch_name --apply               # run the SQL against the parent
+foldout diff branch_name --apply --allow-2way-apply
+                                               # opt-in apply for branches without
+                                               # a merge base (see "Three-way diff")
 ```
+
+`foldout diff` is a true three-way merge against the branch's frozen
+merge base (`__base__<branch>`) — it won't drop tables or rows the
+parent added independently. See **Three-way diff** below for the full
+decision matrix, conflict semantics, and limits.
 
 ## How `foldout diff` works
 
@@ -111,6 +120,237 @@ values. This works for any type with normal text I/O — built-in types
 and extension types (e.g. PostGIS geometry). The diff code itself is
 type-free.
 
+## Three-way diff (what `foldout diff` actually does)
+
+`foldout diff` compares **three** database states, not two:
+
+```
+   BASE   = parent's state at the moment the branch was created
+   BRANCH = branch's current state
+   MAIN   = parent's current state
+```
+
+Without `BASE`, a two-way diff cannot distinguish *"branch added X"*
+from *"parent removed X"* — both look identical when you only compare
+branch vs. parent right now. With `BASE` as the merge base, every
+difference is attributed to exactly one side, just like in `git merge`.
+
+### How we get BASE — instant, free, queryable
+
+When you run `foldout branch main feat1`, foldout takes **two** COW
+copies of `main` inside a single write lock:
+
+- `feat1` — the branch you'll work on.
+- `__base__feat1` — a frozen reference; you don't touch this directly.
+
+Both copies are page-level copy-on-write clones, so they cost ~0 disk
+until either side writes. `__base__feat1` is a real Postgres database
+— `foldout diff` queries it directly with regular SQL while computing
+the merge.
+
+Alongside the branch snapshot file, foldout also writes
+`~/.foldout/snapshots/<branch_oid>_parent.json`, a stat-baseline for
+`main` captured inside the same lock. That lets the diff engine
+**stat-skip** unchanged files on the parent side just as it does on
+the branch side; without it, every diff would have to LSN-scan every
+page of MAIN (which is the difference between ~170 ms and ~22 s on a
+4.76 GB database).
+
+### The decision matrix
+
+For every catalog object O (schema, table, column, index, constraint,
+view, function, sequence) and every row, foldout answers three
+yes/no questions: *was O in BASE? in MAIN? in BRANCH?* — and looks up
+the action:
+
+| BASE | MAIN | BRANCH | Meaning                                  | Action                          |
+|:----:|:----:|:------:|------------------------------------------|---------------------------------|
+|  –   |  –   |  yes   | branch added O                           | CREATE / INSERT on main         |
+|  –   |  yes |   –    | main added O independently               | drift — leave alone             |
+|  –   |  yes |  yes   | both added; same definition?             | no-op if equal, else CONFLICT   |
+|  yes |  yes |   –    | branch removed O                         | DROP / DELETE on main           |
+|  yes |   –  |  yes   | main removed O independently             | drift — leave alone             |
+|  yes |   –  |   –    | both removed                             | no-op                           |
+|  yes |  yes |  yes   | branch changed, main unchanged           | apply branch's change           |
+|  yes |  yes |  yes   | branch unchanged, main changed           | drift — leave alone             |
+|  yes |  yes |  yes   | both changed, same result                | no-op                           |
+|  yes |  yes |  yes   | both changed, different results          | CONFLICT — abort                |
+
+The same matrix runs at every granularity — table existence, column
+existence, column type, primary key, index definition, FK, view body,
+function body, row presence, row value.
+
+### Examples
+
+**1) Independent additions:**
+```
+-- branch creates t1 (since branching); main creates t2 (since branching).
+-- BASE has neither. foldout diff emits:
+CREATE TABLE t1 (...);            -- branch's add
+INSERT INTO t1 VALUES (...);      -- and its data
+-- t2 is NOT dropped. It is reported under "parent drift".
+```
+
+**2) Branch ADD COLUMN, main untouched:**
+```sql
+-- branch:  ALTER TABLE events ADD COLUMN severity int;
+-- main:    no change.
+-- BASE doesn't have `severity`; MAIN doesn't have it. Apply branch's intent:
+ALTER TABLE events ADD COLUMN severity int;
+```
+
+**3) Both sides ADD COLUMN to the same table — different columns:**
+```sql
+-- branch:  ALTER TABLE events ADD COLUMN severity int;
+-- main:    ALTER TABLE events ADD COLUMN region text;
+-- Compatible: different columns. foldout emits ALTER for `severity`;
+-- `region` is parent drift, left alone.
+```
+
+**4) Both ADD COLUMN with the same name, different types → CONFLICT:**
+```
+-- branch: ALTER TABLE u ADD COLUMN v integer;
+-- main:   ALTER TABLE u ADD COLUMN v text;
+-- foldout aborts. No SQL emitted. Reported in the conflict block.
+```
+
+**5) Row-level: branch updates row 1, main updates row 2:**
+```sql
+-- branch: UPDATE u SET v='branch-1' WHERE id=1;
+-- main:   UPDATE u SET v='main-2' WHERE id=2;
+-- foldout emits only the branch's update; row 2 is drift.
+UPDATE u SET v='branch-1' WHERE id=1;
+```
+
+**6) Both update row 1 to different values → CONFLICT.**
+
+**7) Branch DELETEs row 1, main UPDATEd row 1 → CONFLICT** (ambiguous
+intent: branch wants it gone, main was actively editing it).
+
+### Row identity: PK and no-PK
+
+**Tables with a primary key** use the PK as row identity. foldout
+LSN-scans changed pages on BRANCH and MAIN, collects candidate PKs
+(including from BASE's same pages, so DELETEs of rows on unchanged
+pages are still caught), then does authoritative PK-based fetches on
+all three sides. Each row is classified into one of INSERT/UPDATE/DELETE/NOOP
+on each side, and the matrix above is applied.
+
+**Tables without a primary key** can't use PK identity, so foldout
+falls back to **multiset deltas** of changed-page contents:
+
+```
+bD[row] = count(row in BRANCH's changed pages) - count(row in BASE's same pages)
+mD[row] = count(row in MAIN's changed pages)   - count(row in BASE's same pages)
+```
+
+| bD  | mD  | Meaning                                  | Action                       |
+|:---:|:---:|------------------------------------------|------------------------------|
+|  0  |  0  | nothing on either side                   | skip                         |
+|  0  |  ≠0 | parent drift                             | leave alone (reported)       |
+|  ≠0 |  0  | branch's intent                          | INSERT / DELETE              |
+| +N  | +M  | both inserted                            | INSERT max(0, N − M)         |
+| −N  | −M  | both deleted                             | DELETE max(0, N − M)         |
+| +N  | −M  | branch inserts, main deletes (same row)  | CONFLICT                     |
+| −N  | +M  | branch deletes, main inserts (same row)  | CONFLICT                     |
+
+Deletes go out as `DELETE … WHERE ctid = (SELECT ctid FROM t WHERE
+<full-row-match> LIMIT 1)` so duplicates aren't over-deleted.
+
+### Conflicts and drifts
+
+- **Conflict** = both sides changed the same thing in incompatible
+  ways. `foldout diff` (preview) prints all conflicts and still exits
+  0 so you can read them. `foldout diff --apply` exits non-zero and
+  applies **nothing** — v1 has no partial apply.
+- **Drift** = the parent's independent changes since the branch was
+  created. Drift is reported for transparency but `foldout diff`
+  never touches it; applying the branch shouldn't undo work the
+  parent did on its own.
+
+### What `foldout diff --apply` does on success
+
+The SQL is executed against `main`. On success, foldout:
+
+- Drops `__base__<branch>` (its job is done; main is the new reference point).
+- Drops the row in `fld_databases` for the base.
+- Deletes the parent snapshot file.
+
+The branch DB itself is left alone. You can keep working on it; the
+next `foldout diff` from that branch will fall back to a plain
+two-way diff (see below).
+
+### Branches without a base (2-way fallback)
+
+A branch can lack a base in two situations:
+
+1. The branch was created before 3-way diff existed.
+2. You've already run `foldout diff --apply`, which drops the base by design.
+
+In both cases `foldout diff` falls back to a plain **two-way diff**
+(BRANCH vs. MAIN), prints a prominent yellow warning on stderr, and
+**refuses `--apply`** unless you pass `--allow-2way-apply`. A 2-way
+apply can incorrectly DROP / DELETE things the parent added
+independently — opt in only when you're sure main hasn't drifted
+since.
+
+To recover full 3-way behavior after an apply, drop and rebranch.
+
+### What we can and can't do
+
+**Handled end-to-end:**
+
+- DDL: schemas, tables, columns (add / drop / type change), primary
+  keys, indexes, FK / UNIQUE / CHECK constraints, views, materialized
+  views, functions, sequences (including `SERIAL` and `setval`).
+- DML: INSERT / UPDATE / DELETE on tables with a primary key.
+- DML: INSERT / DELETE on tables without a primary key (multiset
+  semantics — UPDATEs appear as DELETE + INSERT, which is the only
+  correct interpretation for an unidentifiable row).
+- Type-agnostic values: jsonb, arrays, custom enums, ranges, PostGIS,
+  any extension type with normal text I/O. Python never interprets
+  the value.
+
+**Deliberately NOT handled in v1 (and why):**
+
+- **View / function bodies at "line-merge" granularity.** Bodies are
+  compared whole. If both sides rewrote the same function: identical
+  text → no-op, different text → CONFLICT. We don't try to 3-way
+  merge function source. *Why:* SQL/PLpgSQL line-merging is its own
+  product; for v1 the safe default is "you resolve it".
+- **No-PK tables with a branch-side `ADD COLUMN`.** The no-PK matcher
+  uses full-row content as identity. Once the column count differs
+  between BASE and BRANCH, `('a',)` and `('a', NULL)` look like
+  different rows to a `Counter` — the matcher would report spurious
+  inserts and deletes. foldout records this as
+  `no_pk_with_added_columns` drift and skips the row-level diff for
+  that table; the DDL still applies. *Workaround:* add a primary key
+  (we strongly recommend one anyway), or pre-apply the column change
+  to main before diffing.
+- **Auto-rebase.** foldout does not pull main's drift into the branch
+  before diffing. If main has drifted heavily, conflicts may be
+  unavoidable. *Why:* rebase semantics are a separate feature and
+  belong in `vka rebase`, not silently inside `diff`.
+- **`--ours` / `--theirs` overrides.** No global conflict-resolution
+  flags. *Why:* in v1 we keep the failure mode loud and explicit; the
+  human resolves. We'll add these once we've seen real workflows that
+  actually want them.
+- **Cross-tablespace tables.** Relations under custom tablespaces
+  (`pg_tblspc/`) aren't followed yet. *Why:* not in scope for v1;
+  uncommon in dev workflows.
+- **Unlogged tables.** WAL-less writes don't bump `pd_lsn`
+  predictably; diff would silently underreport. *Why:* by design,
+  these tables aren't crash-safe — we don't try to merge them.
+- **Managed cloud Postgres** (RDS, Cloud SQL, etc.). The diff reads
+  `PGDATA` files directly. The CLI must run on the same host as
+  Postgres.
+
+**Why no partial apply on conflict?** v1 treats `foldout diff --apply`
+like `git merge` with no resolution strategy: it either applies
+cleanly or it applies nothing. A partial apply would silently mix
+"branch's wins" with "main's drifts" in non-obvious ways. If you need
+to ship a subset, resolve the conflicts in source first.
+
 ## `foldout diff` — requirements, limitations, portability
 
 ### Hard requirements
@@ -145,15 +385,11 @@ type-free.
   would silently underreport. Workaround: avoid unlogged tables in
   branched databases.
 - **Hot standby replicas** can't run `CHECKPOINT`.
-- **Two-way diff only (for now).** `foldout diff` compares branch
-  vs. parent's *current* state. If the parent has independent changes
-  since the branch was created, those would appear as inverse DROPs.
-  See `3-WAY-DIFF-TASK.md` for the planned three-way diff using the
-  snapshot as the merge base.
 
 ### Background docs
-- `DATABASE-DIFF-TASK.md` — design and approach for `foldout diff`.
-- `3-WAY-DIFF-TASK.md` — planned three-way diff.
+- `DATABASE-DIFF-TASK.md` — original design notes for `foldout diff`.
+- `3-WAY-DIFF-TASK.md` — three-way diff design, decision matrix, and
+  implementation status.
 - `notes.md` — hashing benchmark numbers (alternative diff approach).
 
 # Example
