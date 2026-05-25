@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import subprocess
 import time
@@ -297,23 +298,75 @@ def create_branch_database(source_database: str, branch_name: str) -> tuple[str,
     return branch_database_name, oid
 
 
+_REFLINK_SUPPORT_CACHE: dict[str, bool] = {}
+
+
+def supports_reflink(probe_dir: Path) -> bool:
+    """Return True if `probe_dir`'s filesystem supports reflink copies.
+
+    Probes by writing a 1-byte file and trying `cp --reflink=always` on it
+    inside `probe_dir`. Result is cached per directory because the answer
+    is fixed for the lifetime of a process. Cheap (sub-ms) on the cold path.
+
+    Linux-only — on macOS we use `cp -cR` (clonefile) which is supported
+    on every APFS volume, so we don't probe.
+    """
+    if platform.system() == "Darwin":
+        return True
+    key = str(probe_dir)
+    cached = _REFLINK_SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    src = probe_dir / f".fld_cow_probe_src_{os.getpid()}"
+    dst = probe_dir / f".fld_cow_probe_dst_{os.getpid()}"
+    try:
+        src.write_bytes(b"x")
+        result = subprocess.run(
+            ["cp", "--reflink=always", str(src), str(dst)],
+            capture_output=True,
+        )
+        supported = result.returncode == 0
+    except Exception:
+        supported = False
+    finally:
+        for p in (src, dst):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    _REFLINK_SUPPORT_CACHE[key] = supported
+    return supported
+
+
 def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -> None:
-    """Copy database files from source to target using OIDs."""
+    """Copy database files from source to target using OIDs.
+
+    Copy strategy:
+      - FLD_NOCOW=1 forces plain `cp -r` (escape hatch).
+      - macOS: always `cp -cR` (APFS clonefile).
+      - Linux: probe the destination filesystem. If it supports reflinks
+        (btrfs, xfs+reflink), use `cp -R --reflink=always` and refuse to
+        fall back — silent fallback to a full copy on a CoW-capable FS is
+        a real bug (it'd quietly burn gigabytes). If the FS does NOT
+        support reflinks (overlay/tmpfs), drop to plain `cp -r`.
+      - FLD_COW_STRICT=1 disables even the non-CoW fallback, so a missing
+        reflink capability surfaces as an error from a test's perspective.
+    """
     data_path = Path(data_directory)
     base_path = data_path / "base"
-    
+
     source_path = base_path / str(source_oid)
     target_path = base_path / str(target_oid)
-    
+
     if not source_path.exists():
         raise FileNotFoundError(f"Source database directory not found: {source_path}")
-    
+
     if not target_path.exists():
         raise FileNotFoundError(f"Target database directory not found: {target_path}")
-    
-    # Check FLD_NOCOW environment variable to determine copy method
+
     use_nocow = os.getenv("FLD_NOCOW") is not None
-    
+    strict_cow = os.getenv("FLD_COW_STRICT") is not None
+
     subprocess.run(
         ["rm", "-rf", str(target_path) + "/"],
         check=True,
@@ -321,28 +374,40 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
         text=True
     )
 
-    # Use regular cp if FLD_NOCOW is set, otherwise use cp -c for copy-on-write
-    cp_args = ["cp", "-r" if use_nocow else "-cR", str(source_path) + "/", str(target_path) + "/"]
-    
-    try:
+    src_arg = str(source_path) + "/"
+    dst_arg = str(target_path) + "/"
+
+    if use_nocow:
         subprocess.run(
-            cp_args,
-            check=True,
-            capture_output=True,
-            text=True
+            ["cp", "-r", src_arg, dst_arg],
+            check=True, capture_output=True, text=True,
         )
-    except subprocess.CalledProcessError:
-        if not use_nocow:
-            # Fallback to regular recursive copy if cp -c is not available
+    elif platform.system() == "Darwin":
+        subprocess.run(
+            ["cp", "-cR", src_arg, dst_arg],
+            check=True, capture_output=True, text=True,
+        )
+    else:
+        # Linux: probe and branch. Capability is fixed per-FS, so a
+        # single probe is enough to commit to one path.
+        cow_capable = supports_reflink(base_path)
+        if cow_capable or strict_cow:
+            # CoW-capable FS — reflink must succeed. We do NOT fall back:
+            # a failure here means something's wrong with the FS state
+            # (e.g., a NOCOW attribute, a quota issue) and silently doing
+            # a full copy would copy potentially gigabytes.
             subprocess.run(
-                ["cp", "-r", str(source_path) + "/", str(target_path) + "/"],
-                check=True,
-                capture_output=True,
-                text=True
+                ["cp", "-R", "--reflink=always", src_arg, dst_arg],
+                check=True, capture_output=True, text=True,
             )
         else:
-            raise
-    
+            # FS truly doesn't support reflinks (overlay, tmpfs, ext4
+            # without reflink). Plain copy is the only correct option.
+            subprocess.run(
+                ["cp", "-r", src_arg, dst_arg],
+                check=True, capture_output=True, text=True,
+            )
+
     # Remove pg_internal.init file from the copied directory
     pg_internal_init = target_path / "pg_internal.init"
     if pg_internal_init.exists():
@@ -792,22 +857,24 @@ def initialize_database() -> None:
     # Check if foldout database exists, create if not
     if not database_exists("foldout"):
         create_database("foldout")
-    
-    # Check if fld_dbversion table exists
+
+    migration_dir = Path(__file__).parent / "migration"
+
+    # Bootstrap on a brand-new install: foldout_1.sql creates fld_dbversion
+    # itself, so we must run it before get_current_version() can succeed.
     if not table_exists("fld_dbversion"):
-        # Run initial migration
-        migration_dir = Path(__file__).parent / "migration"
         initial_migration = migration_dir / "foldout_1.sql"
         if initial_migration.exists():
             execute_migration(initial_migration)
-        return
-    
-    # Check if we need to run additional migrations
+
+    # Apply every migration strictly newer than the recorded version. This
+    # path also catches fresh installs (they're at version 1 after the
+    # bootstrap above) so we don't need an early return that would leave
+    # later migrations unapplied.
     current_version = int(get_current_version())
     latest_version = get_latest_migration_version()
-    
+
     if current_version < latest_version:
-        migration_dir = Path(__file__).parent / "migration"
         for version in range(current_version + 1, latest_version + 1):
             migration_file = migration_dir / f"foldout_{version}.sql"
             if migration_file.exists():
