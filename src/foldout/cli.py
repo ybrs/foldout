@@ -381,6 +381,16 @@ def diff(branch_name: str, apply: bool, sql_only: bool,
             for s in result["sql"]:
                 click.echo(s)
 
+        # Best-effort warnings (e.g. no-PK table with parallel writes on
+        # both sides). Not a conflict — diff still runs — but the user
+        # should know the result may be ambiguous.
+        for w in result.get("warnings") or []:
+            click.secho(
+                f"\nWARNING: {w['kind']} on {w['key']}",
+                fg="yellow", bold=True, err=True,
+            )
+            click.echo(f"  {w['note']}", err=True)
+
         # In preview mode, conflicts are reported but we exit 0 — the user
         # wants to SEE the conflicts. Only --apply refuses.
         if apply and result.get("conflicts"):

@@ -1597,6 +1597,7 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
     sql_out = []  # DML
     conflicts = []
     drifts = []
+    warnings = []   # best-effort caveats — not conflicts, but worth flagging
 
     with psycopg.connect(dsn(current_db), autocommit=True) as cur_conn, \
          psycopg.connect(dsn(source_db), autocommit=True) as src_conn, \
@@ -1629,6 +1630,7 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
             totals["dml"] = []
             totals["conflicts"] = conflicts
             totals["drifts"] = drifts
+            totals["warnings"] = warnings
             if verbose or __name__ == "__main__":
                 print()
                 print(f"cross-diff-3way ABORTED in {totals['elapsed_ms']:.0f} ms")
@@ -1769,6 +1771,23 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
                         ),
                     })
                     continue
+
+                # Best-effort warning: both sides wrote to this table's pages.
+                # Multiset diff cannot distinguish a parallel UPDATE of the
+                # same row (which should be a CONFLICT) from two compatible
+                # independent INSERTs of similar-looking rows. See CTID-vs-PK.md.
+                if branch_blocks and main_blocks:
+                    warnings.append({
+                        "kind": "no_pk_parallel_writes",
+                        "key": key,
+                        "note": (
+                            "no-PK table written on both branch and parent; "
+                            "row-level diff is best-effort. A parallel UPDATE "
+                            "of the same row will be silently applied as "
+                            "compatible inserts instead of a CONFLICT. "
+                            "Add a primary key to get exact 3-way semantics."
+                        ),
+                    })
 
                 branch_ctids = []
                 base_ctids_for_branch_blocks = []
@@ -2144,17 +2163,23 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
     totals["dml"] = list(sql_out)
     totals["conflicts"] = conflicts
     totals["drifts"] = drifts
+    totals["warnings"] = warnings
 
     if verbose or __name__ == "__main__":
         print()
         print(f"cross-diff-3way complete in {dt:.0f} ms")
         print(f"  DDL_PRE={totals['DDL_PRE']}  DDL_POST={totals['DDL_POST']}")
         print(f"  INSERT={totals['INSERT']}  UPDATE={totals['UPDATE']}  DELETE={totals['DELETE']}")
-        print(f"  conflicts={len(conflicts)}  drifts={len(drifts)}")
+        print(f"  conflicts={len(conflicts)}  drifts={len(drifts)}  warnings={len(warnings)}")
         if conflicts:
             print("\n!! CONFLICTS (no SQL emitted):")
             for c in conflicts:
                 print(f"   {c['kind']} {c['key']}: branch={c.get('branch_op','?')} main={c.get('main_op','?')}")
+        if warnings:
+            print("\n** WARNINGS (best-effort; review before applying):")
+            for w in warnings:
+                print(f"   {w['kind']} {w['key']}")
+                print(f"     {w['note']}")
         if drifts:
             print("\n-- parent drift (left alone):")
             for d in drifts[:10]:
