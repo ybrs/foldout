@@ -1,4 +1,4 @@
-"""Database connection helpers for vkarious."""
+"""Database connection helpers for foldout."""
 
 from __future__ import annotations
 
@@ -15,15 +15,15 @@ import psycopg
 
 
 def get_database_dsn() -> str:
-    """Get the database DSN from VKA_DATABASE environment variable."""
-    dsn = os.getenv("VKA_DATABASE")
+    """Get the database DSN from FLD_DATABASE environment variable."""
+    dsn = os.getenv("FLD_DATABASE")
     if not dsn:
-        raise ValueError("VKA_DATABASE environment variable is required")
+        raise ValueError("FLD_DATABASE environment variable is required")
     return dsn
 
 
 def connect(dsn: str | None = None) -> psycopg.Connection:
-    """Return a new PostgreSQL connection using the provided DSN or VKA_DATABASE."""
+    """Return a new PostgreSQL connection using the provided DSN or FLD_DATABASE."""
     if dsn is None:
         dsn = get_database_dsn()
     return psycopg.connect(dsn)
@@ -40,15 +40,15 @@ def list_databases() -> list[dict[str, str | int]]:
 def get_data_directory() -> str:
     """Return the PostgreSQL data directory path.
 
-    If the environment variable `VKA_PG_DATA_PATH` is defined, its value
+    If the environment variable `FLD_PG_DATA_PATH` is defined, its value
     is returned to allow overriding the detected PostgreSQL data directory.
     This is useful when PostgreSQL is running inside a container while
-    vkarious runs on the host and needs a host-visible path for file
+    foldout runs on the host and needs a host-visible path for file
     operations (e.g., copy-on-write file copying).
 
     Otherwise falls back to querying the server with `SHOW data_directory`.
     """
-    override = os.getenv("VKA_PG_DATA_PATH")
+    override = os.getenv("FLD_PG_DATA_PATH")
     if override:
         return override
 
@@ -70,23 +70,23 @@ def get_database_oid(database_name: str) -> int:
 
 
 def get_branch_parent(branch_name: str) -> tuple[int, int, str]:
-    """Look up branch in vka_databases and return (branch_oid, parent_oid, parent_datname)."""
+    """Look up branch in fld_databases and return (branch_oid, parent_oid, parent_datname)."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT vd.oid, vd.parent, pg.datname
-                FROM vka_databases vd
+                FROM fld_databases vd
                 JOIN pg_database pg ON pg.oid = vd.parent
                 WHERE vd.datname = %s AND vd.type = 'branch'
             """, (branch_name,))
             row = cur.fetchone()
             if row is None:
                 raise ValueError(
-                    f"Branch '{branch_name}' not found in vka_databases "
+                    f"Branch '{branch_name}' not found in fld_databases "
                     f"(or its parent no longer exists)"
                 )
             return row[0], row[1], row[2]
@@ -94,7 +94,7 @@ def get_branch_parent(branch_name: str) -> tuple[int, int, str]:
 
 def get_snapshot_dir() -> Path:
     """Directory where page-diff snapshots for branches live."""
-    base = Path(os.path.expanduser("~/.vkarious/snapshots"))
+    base = Path(os.path.expanduser("~/.foldout/snapshots"))
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -187,7 +187,7 @@ def create_snapshot_database(source_database: str) -> tuple[str, int]:
 
 def create_base_database(source_database: str, branch_name: str) -> tuple[str, int]:
     """Create a COW snapshot of source_database to serve as the merge base
-    for `vka diff` of `branch_name`. Returned name is `__base__<branch_name>`.
+    for `fld diff` of `branch_name`. Returned name is `__base__<branch_name>`.
     """
     base_name = f"__base__{branch_name}"
     with connect() as conn:
@@ -205,19 +205,19 @@ def create_base_database(source_database: str, branch_name: str) -> tuple[str, i
 
 def register_base_database(base_name: str, base_oid: int, parent_oid: int,
                            branch_oid: int) -> None:
-    """Insert the base into vka_databases and link it to its branch."""
+    """Insert the base into fld_databases and link it to its branch."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO vka_databases (oid, datname, parent, created_at, type, status)
+                INSERT INTO fld_databases (oid, datname, parent, created_at, type, status)
                 VALUES (%s, %s, %s, %s, 'base', 'live')
             """, (base_oid, base_name, parent_oid, datetime.now()))
             cur.execute(
-                "UPDATE vka_databases SET base_oid = %s WHERE oid = %s",
+                "UPDATE fld_databases SET base_oid = %s WHERE oid = %s",
                 (base_oid, branch_oid),
             )
         conn.commit()
@@ -227,13 +227,13 @@ def get_branch_base(branch_name: str) -> tuple[int, str] | None:
     """Return (base_oid, base_datname) for a branch, or None if no base set."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT vd.base_oid, pg.datname
-                FROM vka_databases vd
+                FROM fld_databases vd
                 LEFT JOIN pg_database pg ON pg.oid = vd.base_oid
                 WHERE vd.datname = %s AND vd.type = 'branch'
             """, (branch_name,))
@@ -258,16 +258,16 @@ def drop_base_for_branch(branch_name: str) -> str | None:
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(f'DROP DATABASE IF EXISTS "{base_name}"')
-    # Remove vka_databases entries
+    # Remove fld_databases entries
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM vka_databases WHERE oid = %s", (base_oid,))
+            cur.execute("DELETE FROM fld_databases WHERE oid = %s", (base_oid,))
             cur.execute(
-                "UPDATE vka_databases SET base_oid = NULL WHERE datname = %s",
+                "UPDATE fld_databases SET base_oid = NULL WHERE datname = %s",
                 (branch_name,),
             )
         conn.commit()
@@ -311,8 +311,8 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
     if not target_path.exists():
         raise FileNotFoundError(f"Target database directory not found: {target_path}")
     
-    # Check VKA_NOCOW environment variable to determine copy method
-    use_nocow = os.getenv("VKA_NOCOW") is not None
+    # Check FLD_NOCOW environment variable to determine copy method
+    use_nocow = os.getenv("FLD_NOCOW") is not None
     
     subprocess.run(
         ["rm", "-rf", str(target_path) + "/"],
@@ -321,7 +321,7 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
         text=True
     )
 
-    # Use regular cp if VKA_NOCOW is set, otherwise use cp -c for copy-on-write
+    # Use regular cp if FLD_NOCOW is set, otherwise use cp -c for copy-on-write
     cp_args = ["cp", "-r" if use_nocow else "-cR", str(source_path) + "/", str(target_path) + "/"]
     
     try:
@@ -357,7 +357,7 @@ def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> di
     Steps:
     - Ensure the snapshot exists and belongs to the given database.
     - Terminate all connections to the source database and acquire a write lock.
-    - Move the source database's data directory to a backup prefixed with `vka_delete_`.
+    - Move the source database's data directory to a backup prefixed with `fld_delete_`.
     - Drop the source database and recreate a new one with the same name using STRATEGY='FILE_COPY'.
     - Copy the snapshot's data directory into the new database OID path using copy-on-write.
     - Remove `pg_internal.init` from the restored directory after copy.
@@ -395,7 +395,7 @@ def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> di
 
         # Prepare a unique backup directory name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = base_path / f"vka_delete_{source_oid}_{timestamp}"
+        backup_path = base_path / f"fld_delete_{source_oid}_{timestamp}"
         
         # Safety: terminate connections and briefly lock during filesystem move
         terminate_database_connections(database_name)
@@ -487,7 +487,7 @@ def create_database_with_strategy(database_name: str, strategy: str = "FILE_COPY
                 cur.execute(f'''CREATE DATABASE "{database_name}" STRATEGY='{strategy}' ''')
 
 
-def table_exists(table_name: str, database_name: str = "vkarious") -> bool:
+def table_exists(table_name: str, database_name: str = "foldout") -> bool:
     """Check if a table exists in the specified database."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
@@ -506,8 +506,8 @@ def table_exists(table_name: str, database_name: str = "vkarious") -> bool:
         return False
 
 
-def get_current_version(database_name: str = "vkarious") -> str:
-    """Get the current migration version from vka_dbversion table."""
+def get_current_version(database_name: str = "foldout") -> str:
+    """Get the current migration version from fld_dbversion table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
     conn_params['dbname'] = database_name
@@ -516,7 +516,7 @@ def get_current_version(database_name: str = "vkarious") -> str:
     try:
         with psycopg.connect(target_dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT version FROM vka_dbversion LIMIT 1")
+                cur.execute("SELECT version FROM fld_dbversion LIMIT 1")
                 result = cur.fetchone()
                 return result[0] if result else '0'
     except Exception:
@@ -530,15 +530,15 @@ def get_latest_migration_version() -> int:
         return 0
     
     versions = []
-    for file in migration_dir.glob("vkarious_*.sql"):
-        match = re.search(r'vkarious_(\d+)\.sql', file.name)
+    for file in migration_dir.glob("foldout_*.sql"):
+        match = re.search(r'foldout_(\d+)\.sql', file.name)
         if match:
             versions.append(int(match.group(1)))
     
     return max(versions) if versions else 0
 
 
-def execute_migration(migration_file: Path, database_name: str = "vkarious") -> None:
+def execute_migration(migration_file: Path, database_name: str = "foldout") -> None:
     """Execute a migration file against the specified database."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
@@ -554,73 +554,73 @@ def execute_migration(migration_file: Path, database_name: str = "vkarious") -> 
 
 
 def register_source_database(database_name: str, oid: int) -> None:
-    """Register a source database in vka_databases table if not already exists."""
+    """Register a source database in fld_databases table if not already exists."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
-            # Check if database already exists in vka_databases
-            cur.execute("SELECT 1 FROM vka_databases WHERE oid = %s", (oid,))
+            # Check if database already exists in fld_databases
+            cur.execute("SELECT 1 FROM fld_databases WHERE oid = %s", (oid,))
             if cur.fetchone() is None:
                 # Insert the source database record
                 cur.execute("""
-                    INSERT INTO vka_databases (oid, datname, parent, created_at, type, status) 
+                    INSERT INTO fld_databases (oid, datname, parent, created_at, type, status) 
                     VALUES (%s, %s, NULL, %s, 'source', 'live')
                 """, (oid, database_name, datetime.now()))
         conn.commit()
 
 
 def register_snapshot_database(snapshot_name: str, snapshot_oid: int, parent_oid: int) -> None:
-    """Register a snapshot database in vka_databases table."""
+    """Register a snapshot database in fld_databases table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             # Insert the snapshot database record
             cur.execute("""
-                INSERT INTO vka_databases (oid, datname, parent, created_at, type, status) 
+                INSERT INTO fld_databases (oid, datname, parent, created_at, type, status) 
                 VALUES (%s, %s, %s, %s, 'snapshot', 'live')
             """, (snapshot_oid, snapshot_name, parent_oid, datetime.now()))
         conn.commit()
 
 
 def register_branch_database(branch_name: str, branch_oid: int, parent_oid: int) -> None:
-    """Register a branch database in vka_databases table."""
+    """Register a branch database in fld_databases table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             # Insert the branch database record
             cur.execute("""
-                INSERT INTO vka_databases (oid, datname, parent, created_at, type, status) 
+                INSERT INTO fld_databases (oid, datname, parent, created_at, type, status) 
                 VALUES (%s, %s, %s, %s, 'branch', 'live')
             """, (branch_oid, branch_name, parent_oid, datetime.now()))
         conn.commit()
 
 
 def get_databases_with_snapshots() -> dict[str, dict]:
-    """Get databases from vkarious metadata DB with their snapshots in parent-child relationship."""
+    """Get databases from foldout metadata DB with their snapshots in parent-child relationship."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
-            # Get all databases from vka_databases
+            # Get all databases from fld_databases
             cur.execute("""
                 SELECT vd.oid, vd.datname, vd.parent, vd.created_at, vd.type, vd.status,
                        pg.datname as current_datname
-                FROM vka_databases vd
+                FROM fld_databases vd
                 LEFT JOIN pg_database pg ON vd.oid = pg.oid
                 ORDER BY vd.type, vd.created_at
             """)
@@ -674,17 +674,17 @@ def drop_database(database_name: str) -> None:
 
 
 def get_snapshot_record(snapshot_name: str) -> dict | None:
-    """Get snapshot record from vka_databases table."""
+    """Get snapshot record from fld_databases table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT oid, datname, parent, created_at, type 
-                FROM vka_databases 
+                FROM fld_databases 
                 WHERE datname = %s AND type = 'snapshot'
             """, (snapshot_name,))
             result = cur.fetchone()
@@ -700,49 +700,49 @@ def get_snapshot_record(snapshot_name: str) -> dict | None:
 
 
 def update_database_status(oid: int, status: str) -> None:
-    """Update the status of a database in vka_databases table."""
+    """Update the status of a database in fld_databases table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE vka_databases SET status = %s WHERE oid = %s", (status, oid))
+            cur.execute("UPDATE fld_databases SET status = %s WHERE oid = %s", (status, oid))
         conn.commit()
 
 
 def delete_database_record(database_name: str) -> None:
-    """Delete a database record from vka_databases table."""
+    """Delete a database record from fld_databases table."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM vka_databases WHERE datname = %s", (database_name,))
+            cur.execute("DELETE FROM fld_databases WHERE datname = %s", (database_name,))
         conn.commit()
 
 
 def log_restore_operation(old_oid: int, new_oid: int, datname: str, operation: str = "restore", status: str = "started", error_description: str = None) -> int:
-    """Log a restore operation to vka_log table and return the log ID."""
+    """Log a restore operation to fld_log table and return the log ID."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             if status == "started":
                 cur.execute("""
-                    INSERT INTO vka_log (old_oid, new_oid, datname, operation, created_at, started_at, status) 
+                    INSERT INTO fld_log (old_oid, new_oid, datname, operation, created_at, started_at, status) 
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (old_oid, new_oid, datname, operation, datetime.now(), datetime.now(), status))
             else:
                 cur.execute("""
-                    INSERT INTO vka_log (old_oid, new_oid, datname, operation, created_at, status, error_description) 
+                    INSERT INTO fld_log (old_oid, new_oid, datname, operation, created_at, status, error_description) 
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (old_oid, new_oid, datname, operation, datetime.now(), status, error_description))
@@ -752,16 +752,16 @@ def log_restore_operation(old_oid: int, new_oid: int, datname: str, operation: s
 
 
 def log_branch_operation(source_oid: int, branch_oid: int, branch_name: str, operation: str = "branch", status: str = "success") -> int:
-    """Log a branch creation operation to vka_log table and return the log ID."""
+    """Log a branch creation operation to fld_log table and return the log ID."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO vka_log (old_oid, new_oid, datname, operation, created_at, started_at, finished_at, status) 
+                INSERT INTO fld_log (old_oid, new_oid, datname, operation, created_at, started_at, finished_at, status) 
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (source_oid, branch_oid, branch_name, operation, datetime.now(), datetime.now(), datetime.now(), status))
@@ -774,13 +774,13 @@ def update_restore_log(log_id: int, status: str, error_description: str = None) 
     """Update a restore operation log entry."""
     db_dsn = get_database_dsn()
     conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
-    conn_params['dbname'] = "vkarious"
+    conn_params['dbname'] = "foldout"
     target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
     
     with psycopg.connect(target_dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE vka_log 
+                UPDATE fld_log 
                 SET finished_at = %s, status = %s, error_description = %s 
                 WHERE id = %s
             """, (datetime.now(), status, error_description, log_id))
@@ -788,16 +788,16 @@ def update_restore_log(log_id: int, status: str, error_description: str = None) 
 
 
 def initialize_database() -> None:
-    """Initialize the vkarious database and run migrations."""
-    # Check if vkarious database exists, create if not
-    if not database_exists("vkarious"):
-        create_database("vkarious")
+    """Initialize the foldout database and run migrations."""
+    # Check if foldout database exists, create if not
+    if not database_exists("foldout"):
+        create_database("foldout")
     
-    # Check if vka_dbversion table exists
-    if not table_exists("vka_dbversion"):
+    # Check if fld_dbversion table exists
+    if not table_exists("fld_dbversion"):
         # Run initial migration
         migration_dir = Path(__file__).parent / "migration"
-        initial_migration = migration_dir / "vkarious_1.sql"
+        initial_migration = migration_dir / "foldout_1.sql"
         if initial_migration.exists():
             execute_migration(initial_migration)
         return
@@ -809,6 +809,6 @@ def initialize_database() -> None:
     if current_version < latest_version:
         migration_dir = Path(__file__).parent / "migration"
         for version in range(current_version + 1, latest_version + 1):
-            migration_file = migration_dir / f"vkarious_{version}.sql"
+            migration_file = migration_dir / f"foldout_{version}.sql"
             if migration_file.exists():
                 execute_migration(migration_file)

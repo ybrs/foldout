@@ -71,7 +71,7 @@ def segment_paths(pgdata, relpath):
 
 # ---------- catalog ----------
 
-EXCLUDED_SCHEMAS = ("pg_catalog", "information_schema", "vkarious")
+EXCLUDED_SCHEMAS = ("pg_catalog", "information_schema", "foldout")
 EXCLUDED_SCHEMAS_SQL = "(" + ",".join(f"'{s}'" for s in EXCLUDED_SCHEMAS) + ")"
 
 
@@ -1076,7 +1076,7 @@ def fetch_rows_for_ctids(conn, schema, table, ctids,
     `added_defaults` (optional) is a {colname: default_expr_text_or_None} dict
     for columns present on target but not yet on source. For each such column
     we ask Postgres whether the row's value differs from the column's
-    DEFAULT expression, emitted as a boolean "__vka_diff_<col>".
+    DEFAULT expression, emitted as a boolean "__fld_diff_<col>".
 
     Returns (cols, rows). All data columns come back as text strings;
     diff-flag columns come back as Python bool.
@@ -1092,7 +1092,7 @@ def fetch_rows_for_ctids(conn, schema, table, ctids,
             default_sql = expr if expr is not None else "NULL"
             qc = '"' + col.replace('"', '""') + '"'
             select_parts.append(
-                f'({qc} IS DISTINCT FROM ({default_sql})) AS "__vka_diff_{col}"'
+                f'({qc} IS DISTINCT FROM ({default_sql})) AS "__fld_diff_{col}"'
             )
     sql_text = (
         f'SELECT {", ".join(select_parts)} FROM "{schema}"."{table}" '
@@ -1132,7 +1132,7 @@ def fetch_rows_by_pk(conn, schema, table, pk_names, pk_values, column_types,
             default_sql = expr if expr is not None else "NULL"
             qc = '"' + col.replace('"', '""') + '"'
             select_parts.append(
-                f'({qc} IS DISTINCT FROM ({default_sql})) AS "__vka_diff_{col}"'
+                f'({qc} IS DISTINCT FROM ({default_sql})) AS "__fld_diff_{col}"'
             )
     pk_select = "(" + ", ".join(f'"{c}"::text' for c in pk_names) + ")"
     placeholders = ", ".join(
@@ -1150,21 +1150,21 @@ def fetch_rows_by_pk(conn, schema, table, pk_names, pk_values, column_types,
 
 
 def _row_data_dict(cols, row):
-    """Strip ctid and __vka_diff_* synthetic cols. Return {colname: text_value}."""
+    """Strip ctid and __fld_diff_* synthetic cols. Return {colname: text_value}."""
     out = {}
     for i, c in enumerate(cols):
-        if c == "ctid" or c.startswith("__vka_diff_"):
+        if c == "ctid" or c.startswith("__fld_diff_"):
             continue
         out[c] = row[i]
     return out
 
 
 def _diff_flags(cols, row):
-    """Return {colname: bool} for __vka_diff_<col> entries."""
+    """Return {colname: bool} for __fld_diff_<col> entries."""
     out = {}
     for i, c in enumerate(cols):
-        if c.startswith("__vka_diff_"):
-            out[c[len("__vka_diff_"):]] = row[i]
+        if c.startswith("__fld_diff_"):
+            out[c[len("__fld_diff_"):]] = row[i]
     return out
 
 
@@ -1314,12 +1314,12 @@ def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
                 # ---------- no-PK fallback: multiset diff on changed pages ----------
                 # Use full row content as identity. UPDATEs appear as
                 # INSERT + DELETE; that's correct for an unidentifiable row.
-                # Build clean data-only rows (strip ctid + any __vka_diff_* flags).
+                # Build clean data-only rows (strip ctid + any __fld_diff_* flags).
                 def _data_only(all_cols, rows):
                     if not all_cols:
                         return [], []
                     keep_idx = [i for i, c in enumerate(all_cols)
-                                if c != "ctid" and not c.startswith("__vka_diff_")]
+                                if c != "ctid" and not c.startswith("__fld_diff_")]
                     cols = [all_cols[i] for i in keep_idx]
                     out = [tuple(r[i] for i in keep_idx) for r in rows]
                     return cols, out
@@ -1376,7 +1376,7 @@ def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
 
             # column 0 is ctid; data columns start at 1
             # Returned columns: ctid (always position 0), then all data cols,
-            # then optionally synthetic "__vka_diff_<col>" boolean flags for
+            # then optionally synthetic "__fld_diff_<col>" boolean flags for
             # columns we asked Postgres to compare to their DEFAULT.
             def split_columns(cols):
                 data_cols = []          # ordered data col names (no ctid)
@@ -1385,8 +1385,8 @@ def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
                 for i, c in enumerate(cols or []):
                     if c == "ctid":
                         continue
-                    if c.startswith("__vka_diff_"):
-                        diff_flag_idx[c[len("__vka_diff_"):]] = i
+                    if c.startswith("__fld_diff_"):
+                        diff_flag_idx[c[len("__fld_diff_"):]] = i
                     else:
                         col_idx[c] = i
                         data_cols.append(c)
@@ -1914,7 +1914,7 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
             for pk in tbl_inserts:
                 cols, row = branch_map[pk]
                 data_cols = [c for c in cols
-                             if c != "ctid" and not c.startswith("__vka_diff_")]
+                             if c != "ctid" and not c.startswith("__fld_diff_")]
                 col_idx = {c: i for i, c in enumerate(cols)}
                 vals = [row[col_idx[c]] for c in data_cols]
                 cols_s = ", ".join(f'"{c}"' for c in data_cols)

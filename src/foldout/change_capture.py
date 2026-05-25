@@ -1,4 +1,4 @@
-"""Install and verify vkarious change-capture + DDL auditing.
+"""Install and verify foldout change-capture + DDL auditing.
 
 Provides an object-oriented installer that checks if the required
 objects exist in a target database and installs them from a bundled
@@ -16,9 +16,9 @@ from .db import get_database_dsn
 
 
 class ChangeCaptureInstaller:
-    """Installer for vkarious change capture and DDL auditing.
+    """Installer for foldout change capture and DDL auditing.
 
-    Reads SQL from ``src/vkarious/sql/change_capture.sql`` and executes it
+    Reads SQL from ``src/foldout/sql/change_capture.sql`` and executes it
     against a target database when not already installed.
     """
 
@@ -45,7 +45,7 @@ class ChangeCaptureInstaller:
                 cur.execute(
                     """
                     SELECT EXISTS(
-                        SELECT 1 FROM pg_namespace WHERE nspname = 'vkarious'
+                        SELECT 1 FROM pg_namespace WHERE nspname = 'foldout'
                     )
                     """
                 )
@@ -60,7 +60,7 @@ class ChangeCaptureInstaller:
                         SELECT 1
                         FROM pg_class c
                         JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = 'vkarious'
+                        WHERE n.nspname = 'foldout'
                           AND c.relname = 'change_log'
                           AND c.relkind = 'r'
                     )
@@ -77,7 +77,7 @@ class ChangeCaptureInstaller:
                         SELECT 1
                         FROM pg_proc p
                         JOIN pg_namespace n ON n.oid = p.pronamespace
-                        WHERE n.nspname = 'vkarious'
+                        WHERE n.nspname = 'foldout'
                           AND p.proname = 'capture'
                     )
                     """

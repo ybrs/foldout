@@ -1,6 +1,6 @@
-ALTER TABLE vka_databases ADD COLUMN status VARCHAR(255);
+ALTER TABLE fld_databases ADD COLUMN status VARCHAR(255);
 
-CREATE TABLE vka_log (
+CREATE TABLE fld_log (
     id SERIAL PRIMARY KEY,
     old_oid INTEGER,
     new_oid INTEGER,
@@ -13,4 +13,4 @@ CREATE TABLE vka_log (
     error_description TEXT
 );
 
-UPDATE vka_dbversion SET version = '2';
+UPDATE fld_dbversion SET version = '2';

@@ -30,7 +30,7 @@ import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from vkarious import page_diff as page_diff_v2  # noqa: E402
+from foldout import page_diff as page_diff_v2  # noqa: E402
 
 USER = os.environ.get("USER", "aybarsb")
 HOST = "127.0.0.1"
@@ -158,9 +158,9 @@ class Scenario:
 
     def run(self):
         suffix = uuid.uuid4().hex[:8]
-        src = f"vka_t_src_{suffix}"
-        tgt = f"vka_t_tgt_{suffix}"
-        snap_path = f"/tmp/vka_t_{suffix}.json"
+        src = f"fld_t_src_{suffix}"
+        tgt = f"fld_t_tgt_{suffix}"
+        snap_path = f"/tmp/fld_t_{suffix}.json"
         try:
             _drop_db(src)
             _drop_db(tgt)

@@ -6,7 +6,7 @@ def gen_rows(limit):
 
 def main():
     n = int(sys.argv[1])
-    dsn = os.environ.get("VKA_DATABASE")
+    dsn = os.environ.get("FLD_DATABASE")
     if not dsn:
         sys.exit(1)
     with psycopg.connect(dsn) as conn:

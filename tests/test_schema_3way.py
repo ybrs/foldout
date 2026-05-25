@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from vkarious.page_diff import (
+from foldout.page_diff import (
     diff_schemas_3way,
     merge_schemas_3way,
 )

@@ -1,21 +1,21 @@
 """
-End-to-end CLI integration tests for `vka branch` and `vka diff`.
+End-to-end CLI integration tests for `vka branch` and `fld diff`.
 
-These drive the actual `vkarious` binary via subprocess, asserting on
+These drive the actual `foldout` binary via subprocess, asserting on
 its exit code, stdout, and the post-apply state of the databases. This
 catches regressions in the user-facing path that the function-level
 tests in test_page_diff*.py do not exercise:
 
   - argument parsing & subcommand routing
-  - branch creation (vka_databases registration, snapshot files, base linkage)
+  - branch creation (fld_databases registration, snapshot files, base linkage)
   - 3-way vs. 2-way fallback selection
   - --apply success path (incl. auto-cleanup of base + parent snapshot)
   - --apply conflict path (must exit non-zero, parent untouched)
 
 Each scenario sets up its own throwaway parent + branch DBs, runs the
 CLI, asserts, and cleans up everything regardless of outcome (rows in
-vka_databases, the branch + base PG databases, and snapshot JSON files
-in ~/.vkarious/snapshots/).
+fld_databases, the branch + base PG databases, and snapshot JSON files
+in ~/.foldout/snapshots/).
 
 Run directly:    python tests/test_cli_diff.py
 Run via pytest:  pytest tests/test_cli_diff.py -v
@@ -32,11 +32,11 @@ from pathlib import Path
 import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
-VKARIOUS_BIN = os.environ.get("VKARIOUS_BIN") or str(ROOT / ".venv" / "bin" / "vkarious")
+FOLDOUT_BIN = os.environ.get("FOLDOUT_BIN") or str(ROOT / ".venv" / "bin" / "foldout")
 USER = os.environ.get("USER", "aybarsb")
 HOST = "127.0.0.1"
-VKA_DATABASE = os.environ.get(
-    "VKA_DATABASE_FOR_TEST",
+FLD_DATABASE = os.environ.get(
+    "FLD_DATABASE_FOR_TEST",
     f"postgresql://{USER}@{HOST}:5432/postgres",
 )
 
@@ -65,12 +65,12 @@ def _query_one(db, sql):
 
 
 def vka(*args, expect_exit_code=0):
-    """Run vkarious CLI. Returns (returncode, stdout, stderr).
+    """Run foldout CLI. Returns (returncode, stdout, stderr).
     By default asserts exit code matches expect_exit_code; pass None to skip."""
     env = dict(os.environ)
-    env["VKA_DATABASE"] = VKA_DATABASE
+    env["FLD_DATABASE"] = FLD_DATABASE
     result = subprocess.run(
-        [VKARIOUS_BIN, *args],
+        [FOLDOUT_BIN, *args],
         env=env,
         capture_output=True,
         text=True,
@@ -89,8 +89,8 @@ def _lookup_branch(branch_name):
     """Return (branch_oid, base_oid) or (None, None)."""
     try:
         row = _query_one(
-            "vkarious",
-            f"SELECT oid, base_oid FROM vka_databases WHERE datname = '{branch_name}'",
+            "foldout",
+            f"SELECT oid, base_oid FROM fld_databases WHERE datname = '{branch_name}'",
         )
     except Exception:
         return None, None
@@ -100,7 +100,7 @@ def _lookup_branch(branch_name):
 
 
 def _cleanup(parent, branch):
-    """Drop branch + base DBs, vkarious metadata rows, and snapshot files."""
+    """Drop branch + base DBs, foldout metadata rows, and snapshot files."""
     branch_oid, _ = _lookup_branch(branch)
     base_name = f"__base__{branch}"
 
@@ -111,8 +111,8 @@ def _cleanup(parent, branch):
             pass
 
     try:
-        _run("vkarious", [
-            f"DELETE FROM vka_databases WHERE datname IN "
+        _run("foldout", [
+            f"DELETE FROM fld_databases WHERE datname IN "
             f"('{parent}','{branch}','{base_name}')",
         ])
     except Exception:
@@ -121,7 +121,7 @@ def _cleanup(parent, branch):
     if branch_oid is not None:
         for suffix in ("", "_parent"):
             p = Path(os.path.expanduser(
-                f"~/.vkarious/snapshots/{branch_oid}{suffix}.json"
+                f"~/.foldout/snapshots/{branch_oid}{suffix}.json"
             ))
             if p.exists():
                 p.unlink()
@@ -131,27 +131,27 @@ def _cleanup(parent, branch):
 
 def strip_base(branch):
     """Detach the merge base from a branch: drop the __base__<branch> DB,
-    remove its vka_databases row, clear branch.base_oid, delete parent
+    remove its fld_databases row, clear branch.base_oid, delete parent
     snapshot file. Simulates a legacy branch (created pre-3way) or one
     that's already been --applied.
     """
     branch_oid, base_oid = _lookup_branch(branch)
     if base_oid is not None:
         row = _query_one(
-            "vkarious",
-            f"SELECT datname FROM vka_databases WHERE oid = {base_oid}",
+            "foldout",
+            f"SELECT datname FROM fld_databases WHERE oid = {base_oid}",
         )
         if row and row[0]:
             try:
                 _admin(f'DROP DATABASE IF EXISTS "{row[0]}"')
             except Exception:
                 pass
-        _run("vkarious", [f"DELETE FROM vka_databases WHERE oid = {base_oid}"])
-    _run("vkarious",
-         [f"UPDATE vka_databases SET base_oid = NULL WHERE datname = '{branch}'"])
+        _run("foldout", [f"DELETE FROM fld_databases WHERE oid = {base_oid}"])
+    _run("foldout",
+         [f"UPDATE fld_databases SET base_oid = NULL WHERE datname = '{branch}'"])
     if branch_oid is not None:
         parent_snap = Path(os.path.expanduser(
-            f"~/.vkarious/snapshots/{branch_oid}_parent.json"
+            f"~/.foldout/snapshots/{branch_oid}_parent.json"
         ))
         if parent_snap.exists():
             parent_snap.unlink()
@@ -200,7 +200,7 @@ def assert_row_value(db, table, pk_col, pk_val, col, expected):
 
 
 def assert_base_gone(branch):
-    """After successful --apply, base_oid in vka_databases should be NULL
+    """After successful --apply, base_oid in fld_databases should be NULL
     and the __base__<branch> database should not exist."""
     _, base_oid = _lookup_branch(branch)
     assert base_oid is None, f"branch '{branch}' still has base_oid={base_oid}"
@@ -224,8 +224,8 @@ class CliScenario:
 
     def run(self):
         suf = uuid.uuid4().hex[:8]
-        parent = f"vka_cli_p_{suf}"
-        branch = f"vka_cli_b_{suf}"
+        parent = f"fld_cli_p_{suf}"
+        branch = f"fld_cli_b_{suf}"
         try:
             _admin(f'CREATE DATABASE "{parent}";')
             _run(parent, self.setup)
@@ -451,9 +451,9 @@ SCENARIOS = [
 # ---------------- entry points ----------------
 
 def main():
-    if not os.path.exists(VKARIOUS_BIN):
-        print(f"FAIL: vkarious binary not found at {VKARIOUS_BIN}")
-        print("       set $VKARIOUS_BIN to override")
+    if not os.path.exists(FOLDOUT_BIN):
+        print(f"FAIL: foldout binary not found at {FOLDOUT_BIN}")
+        print("       set $FOLDOUT_BIN to override")
         sys.exit(1)
     failures = 0
     for sc in SCENARIOS:

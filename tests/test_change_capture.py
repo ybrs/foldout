@@ -4,8 +4,8 @@ from typing import Any, Optional
 
 from click.testing import CliRunner
 
-import vkarious.cli as cli_mod
-from vkarious.change_capture import ChangeCaptureInstaller
+import foldout.cli as cli_mod
+from foldout.change_capture import ChangeCaptureInstaller
 
 
 class _FakeCursor:
@@ -71,7 +71,7 @@ def test_installer_installs_when_missing(monkeypatch) -> None:
     def fake_connect(dsn: str) -> _FakeConn:  # type: ignore[override]
         return _FakeConn()
 
-    import vkarious.change_capture as cc
+    import foldout.change_capture as cc
 
     monkeypatch.setattr(cc.psycopg, "connect", fake_connect)
     monkeypatch.setattr(cc, "get_database_dsn", lambda: "postgresql://ignored")

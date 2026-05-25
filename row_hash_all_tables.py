@@ -2,7 +2,7 @@ import os, sys, time, threading, psycopg, subprocess, shlex, math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg import sql
 
-dsn = os.environ["VKA_DATABASE"]
+dsn = os.environ["FLD_DATABASE"]
 
 def list_user_tables_with_stats(con):
     with con.cursor() as cur:
@@ -141,7 +141,7 @@ def main():
         use_blake3 = False
         sys.argv.pop(1)
     table_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    workers = int(os.environ.get("VKA_HASH_WORKERS", "1"))
+    workers = int(os.environ.get("FLD_HASH_WORKERS", "1"))
     with psycopg.connect(dsn, autocommit=True) as con:
         if table_arg:
             if "." in table_arg:

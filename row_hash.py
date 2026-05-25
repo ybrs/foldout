@@ -1,6 +1,6 @@
 import os, sys, psycopg, subprocess, shlex
 
-dsn   = os.environ["VKA_DATABASE"]
+dsn   = os.environ["FLD_DATABASE"]
 table = sys.argv[1]
 
 cmd = shlex.split("openssl dgst -sha256 -binary")

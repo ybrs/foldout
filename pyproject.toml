@@ -1,8 +1,8 @@
 [project]
-name = "vkarious"
+name = "foldout"
 version = "0.1.0"
 description = "Tool to get snapshots of PostgreSQL databases."
-authors = [{name = "Vkarious Developers", email = "dev@example.com"}]
+authors = [{name = "Foldout Developers", email = "dev@example.com"}]
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
@@ -13,17 +13,17 @@ dependencies = [
 ]
 
 [project.scripts]
-vkarious = "vkarious.cli:cli"
+foldout = "foldout.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vkarious"]
+packages = ["src/foldout"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/vkarious"]
+include = ["src/foldout"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

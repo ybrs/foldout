@@ -1,10 +1,10 @@
-CREATE TABLE vka_dbversion (
+CREATE TABLE fld_dbversion (
     version VARCHAR(255) DEFAULT '0'
 );
 
-INSERT INTO vka_dbversion (version) VALUES ('0');
+INSERT INTO fld_dbversion (version) VALUES ('0');
 
-CREATE TABLE vka_databases (
+CREATE TABLE fld_databases (
     oid INTEGER,
     datname VARCHAR(255),
     parent INTEGER,
@@ -12,4 +12,4 @@ CREATE TABLE vka_databases (
     type VARCHAR(254)
 );
 
-UPDATE vka_dbversion SET version = '1';
+UPDATE fld_dbversion SET version = '1';

@@ -29,7 +29,7 @@ import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from vkarious import page_diff  # noqa: E402
+from foldout import page_diff  # noqa: E402
 
 USER = os.environ.get("USER", "aybarsb")
 HOST = "127.0.0.1"
@@ -132,12 +132,12 @@ class Scenario3way:
 
     def run(self):
         suf = uuid.uuid4().hex[:8]
-        src = f"vka_3w_src_{suf}"
-        base = f"vka_3w_base_{suf}"
-        tgt = f"vka_3w_tgt_{suf}"
-        expected = f"vka_3w_exp_{suf}"
-        snap = f"/tmp/vka_3w_{suf}.json"
-        parent_snap = f"/tmp/vka_3w_{suf}_parent.json"
+        src = f"fld_3w_src_{suf}"
+        base = f"fld_3w_base_{suf}"
+        tgt = f"fld_3w_tgt_{suf}"
+        expected = f"fld_3w_exp_{suf}"
+        snap = f"/tmp/fld_3w_{suf}.json"
+        parent_snap = f"/tmp/fld_3w_{suf}_parent.json"
         try:
             for d in (src, base, tgt, expected):
                 _drop(d)
