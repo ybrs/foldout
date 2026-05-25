@@ -8,6 +8,7 @@ import click
 
 from . import __version__
 from .db import (
+    connect,
     copy_database_files,
     create_base_database,
     create_branch_database,
@@ -24,6 +25,8 @@ from .db import (
     get_data_directory,
     get_database_oid,
     get_databases_with_snapshots,
+    get_file_copy_method,
+    get_pg_major_version,
     get_snapshot_record,
     initialize_database,
     list_databases,
@@ -33,6 +36,7 @@ from .db import (
     register_snapshot_database,
     register_source_database,
     restore_database_from_snapshot,
+    should_use_native_clone,
 )
 from .change_capture import ChangeCaptureInstaller
 from . import page_diff
@@ -42,6 +46,39 @@ def run_command(command: list[str]) -> None:
     """Run a shell command and echo its output."""
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     click.echo(result.stdout.strip())
+
+
+def _probe_clone_strategy() -> bool:
+    """Decide whether to skip the manual `cp --reflink` step.
+
+    On PG 18 with `file_copy_method = clone`, PostgreSQL's own
+    `CREATE DATABASE ... STRATEGY = FILE_COPY` produces reflinks, so the
+    manual copy step in `copy_database_files()` is redundant.
+
+    On PG 18 with the default `copy` method, we emit a yellow warning
+    pointing the operator at the GUC and fall back to the manual path
+    (which still produces reflinks via `cp --reflink=always` on a CoW
+    filesystem). On PG < 18 the GUC doesn't exist and we just use the
+    manual path silently — that's the only option pre-18.
+    """
+    with connect() as conn:
+        major = get_pg_major_version(conn)
+        method = get_file_copy_method(conn)
+    if major >= 18 and method == "clone":
+        click.echo(
+            "PostgreSQL 18 detected with file_copy_method='clone' — "
+            "using native CREATE DATABASE clone (no manual copy)"
+        )
+        return True
+    if major >= 18:
+        click.secho(
+            f"WARNING: PostgreSQL {major} detected but file_copy_method="
+            f"'{method}'. For native CoW clones set "
+            f"`file_copy_method = clone` in postgresql.conf. Falling back "
+            f"to the manual reflink copy path used on PG < 18.",
+            fg="yellow", err=True,
+        )
+    return False
 
 
 @click.group()
@@ -57,15 +94,15 @@ def branch(database_name: str, branch_name: str) -> None:
     """Create a branch of DATABASE_NAME with the given BRANCH_NAME."""
     try:
         click.echo(f"Creating branch '{branch_name}' of database '{database_name}'...")
-        
+
         # Get source database OID
         source_oid = get_database_oid(database_name)
         click.echo(f"Source database OID: {source_oid}")
-        
+
         # Register source database in fld_databases table
         register_source_database(database_name, source_oid)
         click.echo(f"Registered source database '{database_name}' in fld_databases")
-        
+
         # Ensure change-capture is installed on the source
         installer = ChangeCaptureInstaller()
         if installer.ensure_installed(database_name):
@@ -73,39 +110,52 @@ def branch(database_name: str, branch_name: str) -> None:
         else:
             click.echo("foldout change-capture already present on source database")
 
+        use_native_clone = _probe_clone_strategy()
+
         # Get PostgreSQL data directory
         data_directory = get_data_directory()
         click.echo(f"PostgreSQL data directory: {data_directory}")
-        
-        # Create new branch database and get its OID
-        branch_database_name, target_oid = create_branch_database(database_name, branch_name)
-        click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
-        
-        # Create the base snapshot of the source (for 3-way diff merge base).
-        # COW copy from the same source, taken under the same write lock so
-        # all three (source, branch, base) are at the same LSN at branch time.
-        base_database_name, base_oid = create_base_database(database_name, branch_name)
-        click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
 
-        # Lock the source database to prevent writes during copy
-        with database_write_lock(database_name):
-            click.echo(f"Acquired write lock on database '{database_name}'")
+        if use_native_clone:
+            # PG clones the source itself for both target and base.
+            branch_database_name, target_oid = create_branch_database(
+                database_name, branch_name, template=database_name,
+            )
+            click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
 
-            # Copy database files (source -> branch)
-            copy_database_files(data_directory, source_oid, target_oid)
-            click.echo("Database files copied successfully")
+            base_database_name, base_oid = create_base_database(
+                database_name, branch_name, template=database_name,
+            )
+            click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
 
-            # Copy database files (source -> base)
-            copy_database_files(data_directory, source_oid, base_oid)
-            click.echo("Base snapshot files copied successfully")
+            click.echo("Branch and base files cloned by PostgreSQL (no manual copy)")
+            # The parent page-diff snapshot only reads stat() values on the
+            # source's files, but we keep it under a brief lock so the
+            # recorded (size, mtime) matches what was just cloned.
+            with database_write_lock(database_name):
+                parent_snap_path = get_branch_parent_snapshot_path(target_oid)
+                page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
+                click.echo(f"Saved parent snapshot: {parent_snap_path}")
+        else:
+            # Empty FILE_COPY DBs, then overwrite both with manual reflink cps.
+            branch_database_name, target_oid = create_branch_database(database_name, branch_name)
+            click.echo(f"Created branch database '{branch_database_name}' with OID: {target_oid}")
 
-            # Take a page-diff snapshot of the PARENT while we still hold
-            # the write lock — guarantees the captured (size, mtime, relfilenode)
-            # values match the parent's exact state at branch creation. Used
-            # by 3-way diff to stat-skip parent files that haven't drifted.
-            parent_snap_path = get_branch_parent_snapshot_path(target_oid)
-            page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
-            click.echo(f"Saved parent snapshot: {parent_snap_path}")
+            base_database_name, base_oid = create_base_database(database_name, branch_name)
+            click.echo(f"Created base snapshot '{base_database_name}' with OID: {base_oid}")
+
+            with database_write_lock(database_name):
+                click.echo(f"Acquired write lock on database '{database_name}'")
+
+                copy_database_files(data_directory, source_oid, target_oid)
+                click.echo("Database files copied successfully")
+
+                copy_database_files(data_directory, source_oid, base_oid)
+                click.echo("Base snapshot files copied successfully")
+
+                parent_snap_path = get_branch_parent_snapshot_path(target_oid)
+                page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
+                click.echo(f"Saved parent snapshot: {parent_snap_path}")
 
         # Ensure change-capture is present on the new branch database as well
         if installer.ensure_installed(branch_database_name):
@@ -144,37 +194,46 @@ def snapshot(database_name: str) -> None:
     """Create a snapshot of DATABASE_NAME."""
     try:
         click.echo(f"Creating snapshot of database '{database_name}'...")
-        
+
         # Get source database OID
         source_oid = get_database_oid(database_name)
         click.echo(f"Source database OID: {source_oid}")
-        
+
         # Register source database in fld_databases table
         register_source_database(database_name, source_oid)
         click.echo(f"Registered source database '{database_name}' in fld_databases")
-        
-        # Get PostgreSQL data directory
+
+        use_native_clone = _probe_clone_strategy()
+
+        # Get PostgreSQL data directory (only needed for the manual path,
+        # but harmless to fetch eagerly so the operator sees it in the log).
         data_directory = get_data_directory()
         click.echo(f"PostgreSQL data directory: {data_directory}")
-        
-        # Create new snapshot database and get its OID
-        snapshot_name, target_oid = create_snapshot_database(database_name)
-        click.echo(f"Created snapshot database '{snapshot_name}' with OID: {target_oid}")
-        
-        # Lock the source database to prevent writes during copy
-        with database_write_lock(database_name):
-            click.echo(f"Acquired write lock on database '{database_name}'")
-            
-            # Copy database files
-            copy_database_files(data_directory, source_oid, target_oid)
-            click.echo("Database files copied successfully")
-        
+
+        if use_native_clone:
+            # PG clones source itself. CREATE DATABASE ... TEMPLATE source
+            # locks out new connections to the source until it finishes and
+            # fails if any other backend is already connected.
+            snapshot_name, target_oid = create_snapshot_database(
+                database_name, template=database_name,
+            )
+            click.echo(f"Created snapshot database '{snapshot_name}' with OID: {target_oid}")
+            click.echo("Database files cloned by PostgreSQL (no manual copy)")
+        else:
+            # Empty FILE_COPY DB, then overwrite with manual reflink cp.
+            snapshot_name, target_oid = create_snapshot_database(database_name)
+            click.echo(f"Created snapshot database '{snapshot_name}' with OID: {target_oid}")
+            with database_write_lock(database_name):
+                click.echo(f"Acquired write lock on database '{database_name}'")
+                copy_database_files(data_directory, source_oid, target_oid)
+                click.echo("Database files copied successfully")
+
         # Register snapshot database in fld_databases table
         register_snapshot_database(snapshot_name, target_oid, source_oid)
         click.echo(f"Registered snapshot '{snapshot_name}' in fld_databases with parent OID {source_oid}")
-        
+
         click.echo(f"Snapshot completed successfully: {snapshot_name}")
-        
+
     except Exception as e:
         click.echo(f"Error creating snapshot: {e}", err=True)
         raise click.ClickException(str(e))

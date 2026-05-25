@@ -16,7 +16,7 @@ from .pg_cluster import PgCluster
 from .pg_runtime import PgBinary, PgBinaryManager
 
 
-PG_TEST_MATRIX: tuple[int, ...] = (16, 17)
+PG_TEST_MATRIX: tuple[int, ...] = (16, 17, 18)
 
 
 @pytest.fixture(scope="session")
