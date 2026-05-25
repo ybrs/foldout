@@ -298,24 +298,72 @@ def create_branch_database(source_database: str, branch_name: str) -> tuple[str,
     return branch_database_name, oid
 
 
+_REFLINK_SUPPORT_CACHE: dict[str, bool] = {}
+
+
+def supports_reflink(probe_dir: Path) -> bool:
+    """Return True if `probe_dir`'s filesystem supports reflink copies.
+
+    Probes by writing a 1-byte file and trying `cp --reflink=always` on it
+    inside `probe_dir`. Result is cached per directory because the answer
+    is fixed for the lifetime of a process. Cheap (sub-ms) on the cold path.
+
+    Linux-only — on macOS we use `cp -cR` (clonefile) which is supported
+    on every APFS volume, so we don't probe.
+    """
+    if platform.system() == "Darwin":
+        return True
+    key = str(probe_dir)
+    cached = _REFLINK_SUPPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    src = probe_dir / f".fld_cow_probe_src_{os.getpid()}"
+    dst = probe_dir / f".fld_cow_probe_dst_{os.getpid()}"
+    try:
+        src.write_bytes(b"x")
+        result = subprocess.run(
+            ["cp", "--reflink=always", str(src), str(dst)],
+            capture_output=True,
+        )
+        supported = result.returncode == 0
+    except Exception:
+        supported = False
+    finally:
+        for p in (src, dst):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    _REFLINK_SUPPORT_CACHE[key] = supported
+    return supported
+
+
 def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -> None:
-    """Copy database files from source to target using OIDs."""
+    """Copy database files from source to target using OIDs.
+
+    Copy strategy:
+      - FLD_NOCOW=1 forces plain `cp -r` (escape hatch).
+      - macOS: always `cp -cR` (APFS clonefile).
+      - Linux: probe the destination filesystem. If it supports reflinks
+        (btrfs, xfs+reflink), use `cp -R --reflink=always` and refuse to
+        fall back — silent fallback to a full copy on a CoW-capable FS is
+        a real bug (it'd quietly burn gigabytes). If the FS does NOT
+        support reflinks (overlay/tmpfs), drop to plain `cp -r`.
+      - FLD_COW_STRICT=1 disables even the non-CoW fallback, so a missing
+        reflink capability surfaces as an error from a test's perspective.
+    """
     data_path = Path(data_directory)
     base_path = data_path / "base"
-    
+
     source_path = base_path / str(source_oid)
     target_path = base_path / str(target_oid)
-    
+
     if not source_path.exists():
         raise FileNotFoundError(f"Source database directory not found: {source_path}")
-    
+
     if not target_path.exists():
         raise FileNotFoundError(f"Target database directory not found: {target_path}")
-    
-    # FLD_NOCOW forces a plain recursive copy (useful for non-CoW filesystems).
-    # FLD_COW_STRICT skips the fallback path so a missing reflink capability
-    # surfaces as an error rather than a silent slow copy — required for
-    # tests that need to prove the COW path was taken.
+
     use_nocow = os.getenv("FLD_NOCOW") is not None
     strict_cow = os.getenv("FLD_COW_STRICT") is not None
 
@@ -326,39 +374,40 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
         text=True
     )
 
-    # Pick the right cp flags per platform:
-    #   - macOS (Darwin): `cp -cR` uses clonefile() against APFS.
-    #   - Linux: `cp -R --reflink=always` uses FICLONE/FICLONERANGE against
-    #     a CoW filesystem (btrfs, xfs+reflink). `--reflink=always` fails
-    #     loudly if the FS doesn't support reflinks.
     src_arg = str(source_path) + "/"
     dst_arg = str(target_path) + "/"
-    if use_nocow:
-        cp_args = ["cp", "-r", src_arg, dst_arg]
-    elif platform.system() == "Darwin":
-        cp_args = ["cp", "-cR", src_arg, dst_arg]
-    else:
-        cp_args = ["cp", "-R", "--reflink=always", src_arg, dst_arg]
 
-    try:
-        subprocess.run(
-            cp_args,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-    except subprocess.CalledProcessError:
-        if use_nocow or strict_cow:
-            raise
-        # Fallback to regular recursive copy if reflink isn't available
-        # (e.g. running on a non-CoW filesystem like overlay/tmpfs).
+    if use_nocow:
         subprocess.run(
             ["cp", "-r", src_arg, dst_arg],
-            check=True,
-            capture_output=True,
-            text=True
+            check=True, capture_output=True, text=True,
         )
-    
+    elif platform.system() == "Darwin":
+        subprocess.run(
+            ["cp", "-cR", src_arg, dst_arg],
+            check=True, capture_output=True, text=True,
+        )
+    else:
+        # Linux: probe and branch. Capability is fixed per-FS, so a
+        # single probe is enough to commit to one path.
+        cow_capable = supports_reflink(base_path)
+        if cow_capable or strict_cow:
+            # CoW-capable FS — reflink must succeed. We do NOT fall back:
+            # a failure here means something's wrong with the FS state
+            # (e.g., a NOCOW attribute, a quota issue) and silently doing
+            # a full copy would copy potentially gigabytes.
+            subprocess.run(
+                ["cp", "-R", "--reflink=always", src_arg, dst_arg],
+                check=True, capture_output=True, text=True,
+            )
+        else:
+            # FS truly doesn't support reflinks (overlay, tmpfs, ext4
+            # without reflink). Plain copy is the only correct option.
+            subprocess.run(
+                ["cp", "-r", src_arg, dst_arg],
+                check=True, capture_output=True, text=True,
+            )
+
     # Remove pg_internal.init file from the copied directory
     pg_internal_init = target_path / "pg_internal.init"
     if pg_internal_init.exists():

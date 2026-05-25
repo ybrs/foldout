@@ -64,17 +64,21 @@ def _parse_snapshot_name(cli_output: str) -> str:
 
 
 _FILEFRAG_EXTENT_RE = re.compile(
-    r"^\s*\d+:\s*\d+\.\.\s*\d+:\s*(\d+)\.\.\s*(\d+):"
+    r"^\s*\d+:\s*\d+\.\.\s*\d+:\s*(\d+)\.\.\s*(\d+):\s*(\d+):"
+)
+_FILEFRAG_HEADER_RE = re.compile(
+    r"\((\d+)\s+blocks?\s+of\s+(\d+)\s+bytes\)"
 )
 
 
-def _physical_extents(file_path: Path) -> set[tuple[int, int]]:
-    """Return the set of (physical_start, physical_end) extents for a file.
+def _filefrag(file_path: Path) -> tuple[set[tuple[int, int]], int, int]:
+    """Run `filefrag -v` and return (extents, block_count, block_size).
 
-    Uses `filefrag -v`. Two files sharing extents (reflink) will have
-    identical physical extent ranges. Empty/all-zero files report no
-    extents on btrfs (the FS may store them inline), so callers should
-    pick a non-trivial file.
+    extents: set of (physical_start_block, physical_end_block).
+    block_count, block_size: from the header line, e.g. "(25 blocks of 4096 bytes)".
+    On btrfs, very small files may be stored inline (no extents); we return
+    an empty set with block_size from the header so callers can still reason
+    about their on-disk footprint (effectively 0 for inline).
     """
     result = subprocess.run(
         ["filefrag", "-v", str(file_path)],
@@ -83,11 +87,46 @@ def _physical_extents(file_path: Path) -> set[tuple[int, int]]:
         text=True,
     )
     extents: set[tuple[int, int]] = set()
+    block_count = 0
+    block_size = 4096
     for line in result.stdout.splitlines():
+        header = _FILEFRAG_HEADER_RE.search(line)
+        if header:
+            block_count = int(header.group(1))
+            block_size = int(header.group(2))
         match = _FILEFRAG_EXTENT_RE.match(line)
         if match:
             extents.add((int(match.group(1)), int(match.group(2))))
+    return extents, block_count, block_size
+
+
+def _physical_extents(file_path: Path) -> set[tuple[int, int]]:
+    """Convenience wrapper: just the extent set, no header info."""
+    extents, _, _ = _filefrag(file_path)
     return extents
+
+
+def _unshared_bytes(src_file: Path, snap_file: Path) -> int:
+    """Bytes in `snap_file`'s extents that are NOT shared with `src_file`.
+
+    After a reflink, every extent in the destination shares its physical
+    range with one in the source, so the result is 0. After a full copy
+    (silent fallback), the destination has its own brand-new extents and
+    the result equals the file's on-disk size.
+    """
+    src_extents, _, _ = _filefrag(src_file)
+    snap_extents, snap_blocks, snap_block_size = _filefrag(snap_file)
+    unique = snap_extents - src_extents
+    if not unique:
+        return 0
+    total_blocks = 0
+    for start, end in unique:
+        total_blocks += end - start + 1
+    # Cap at the file's reported on-disk block count — filefrag can over-
+    # report on btrfs preallocation, and we don't want to fabricate bytes
+    # beyond what the file could possibly occupy.
+    capped = min(total_blocks, snap_blocks)
+    return capped * snap_block_size
 
 
 def _pick_largest_relation(db_dir: Path) -> Path:
@@ -145,19 +184,30 @@ def test_snapshot_then_restore(foldout_env: PgCluster,
     assert _labels(cluster, SOURCE_DB) == ["one", "two", "three"]
 
 
+def test_filesystem_cow_probe_detects_btrfs(foldout_env: PgCluster) -> None:
+    """`supports_reflink()` must return True for the btrfs-backed PGDATA."""
+    from foldout.db import supports_reflink
+    cluster = foldout_env
+    base = cluster.pgdata / "base"
+    assert supports_reflink(base) is True, (
+        f"expected btrfs at {base} to support reflinks; CoW detection "
+        f"returned False"
+    )
+
+
 def test_snapshot_uses_reflinks(foldout_env: PgCluster,
                                 tmp_path: Path,
                                 monkeypatch: pytest.MonkeyPatch) -> None:
     """Strict-COW snapshot must succeed AND share extents with the source.
 
-    We assert two independent things:
+    Three independent checks:
       1. `FLD_COW_STRICT=1` forces `cp --reflink=always` with no fallback.
-        If reflinks fail, the snapshot errors out. A clean exit means the
-        FS-level CoW path was taken.
-      2. The largest relation file in the snapshot shares physical extents
-        with the corresponding file in the source (verified via filefrag).
-        This is the definitive test that the copy was a reflink rather
-        than a full bytewise copy that happened to succeed.
+         A clean exit means the FS-level CoW path was taken.
+      2. The largest relation file shares physical extents with the source
+         (per-file proof that the copy was a reflink).
+      3. The TOTAL bytes occupied by snapshot extents that are not shared
+         with the source stays below a few MB — i.e. no silent fallback to
+         a full bytewise copy that would have duplicated megabytes/GBs.
     """
     cluster = foldout_env
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -190,18 +240,50 @@ def test_snapshot_uses_reflinks(foldout_env: PgCluster,
             snap_oid = int(cur.fetchone()[0])
 
     base = cluster.pgdata / "base"
-    src_file = _pick_largest_relation(base / str(src_oid))
-    snap_file = base / str(snap_oid) / src_file.name
+    src_dir = base / str(src_oid)
+    snap_dir = base / str(snap_oid)
 
+    # Check 2: per-file reflink proof on the largest relation.
+    src_file = _pick_largest_relation(src_dir)
+    snap_file = snap_dir / src_file.name
     assert snap_file.exists(), f"expected reflinked file at {snap_file}"
-
     src_extents = _physical_extents(src_file)
     snap_extents = _physical_extents(snap_file)
-
     assert src_extents, f"source file {src_file} reported no extents"
     shared = src_extents & snap_extents
     assert shared, (
         f"snapshot file {snap_file} shares no physical extents with source "
         f"{src_file} (src={src_extents}, snap={snap_extents}) — reflink "
         f"did not take effect"
+    )
+
+    # Check 3: aggregate disk-usage proof across every file in the snapshot.
+    # If we'd silently fallen back to `cp -r`, every snapshot file would
+    # have its own brand-new extents and `unshared_total` would equal the
+    # full source size (tens of MB). Reflinks bring it down to just the
+    # catalog files PG's FILE_COPY strategy rewrites — well under 5 MB.
+    total_src_logical = 0
+    unshared_total = 0
+    files_compared = 0
+    for snap_entry in snap_dir.iterdir():
+        if not snap_entry.is_file():
+            continue
+        src_entry = src_dir / snap_entry.name
+        if not src_entry.exists():
+            # Snapshot has files the source doesn't — count them in full
+            # since they cannot be reflinks (no source extents to share).
+            _, blocks, bsize = _filefrag(snap_entry)
+            unshared_total += blocks * bsize
+            continue
+        total_src_logical += src_entry.stat().st_size
+        unshared_total += _unshared_bytes(src_entry, snap_entry)
+        files_compared += 1
+
+    assert files_compared > 0, "no files to compare — snapshot dir was empty?"
+    threshold = 5 * 1024 * 1024  # 5 MB
+    assert unshared_total < threshold, (
+        f"silent fallback suspected: {unshared_total} bytes of snapshot "
+        f"extents are NOT shared with source (source total = "
+        f"{total_src_logical} bytes across {files_compared} files). "
+        f"Threshold for legitimate catalog rewrites: {threshold} bytes."
     )
