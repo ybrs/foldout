@@ -189,50 +189,87 @@ for v1).
   base linkage.
 - `tests/test_page_diff.py` — new conflict + drift scenarios.
 
-## Status (as of 2026-05-23)
+## Status (as of 2026-05-25)
 
-### Done
+### Done — engine
 
-- ✅ `merge_schemas_3way()` — full 3-way schema merge:
-  table-level for adds/drops, column-level inside common tables
-  (so "branch adds X, parent adds Y" is compatible, not a conflict),
-  primary keys, indexes, constraints, views, materialized views,
-  functions, sequences, schemas.
+- ✅ `merge_schemas_3way()` — full 3-way schema merge: table-level for
+  adds/drops, column-level inside common tables (so "branch adds X,
+  parent adds Y" is compatible, not a conflict), primary keys,
+  indexes, constraints, views, materialized views, functions,
+  sequences, schemas.
 - ✅ `diff_schemas_3way()` returns `(pre, post, conflicts, drifts)`.
 - ✅ `cross_diff_3way()` — full row-level 3-way:
   page-LSN scan on both sides; candidate PKs collected from changed
   pages of branch and main AND from base's same-block-number pages
   (so DELETEs are detected); authoritative PK-based fetches on all
   three sides; per-row 3-way classification.
-- ✅ `vka branch` creates `__base__<branch>` (COW snapshot of parent)
-  and saves a stats snapshot of the parent inside the write lock.
-- ✅ `vka diff` uses 3-way when base exists, drops base + parent snap
-  on successful `--apply`.
-- ✅ Conflict abort: `vka diff --apply` exits non-zero on any conflict.
-- ✅ Drift report: parent's independent changes are listed but not
-  touched (column, table, row, sequence, function, view, etc.).
-- ✅ Stat-skip on main side via the parent snapshot — restored real-DB
-  diff time from ~22 s to ~170 ms on coinleverprod.
 - ✅ Type-agnostic value handling: every column fetched as `col::text`,
   emitted as `'<text>'::<typename>`. Works for jsonb, arrays, custom
-  enums, PostGIS, etc.
-- ✅ Sequences (incl. `SERIAL`): `CREATE SEQUENCE`, `ALTER ... OWNED BY`,
-  `setval(...)` emitted in the right order.
+  enums, PostGIS, etc. — no Python-side type interpretation.
+- ✅ Sequences (incl. `SERIAL`): `CREATE SEQUENCE`,
+  `ALTER ... OWNED BY`, `setval(...)` emitted in dependency order.
+- ✅ Drift report: parent's independent changes are listed but not
+  touched (column, table, row, sequence, function, view, etc.).
 
-### Tests
+### Done — branching / snapshot lifecycle
 
-- ✅ `tests/test_schema_3way.py` — 9 unit tests on the dict-level merge
-  matrix (no Postgres needed).
-- ✅ `tests/test_page_diff_3way.py` — 12 e2e scenarios against a real
-  Postgres, exercising `cross_diff_3way()` directly with a parent
-  snapshot.
-- ✅ `tests/test_page_diff.py` — 24 e2e scenarios for the 2-way path
-  (regression coverage; still all passing).
-- ❌ **CLI integration test** — see `NEXT-STEPS.md`.
+- ✅ `vka branch` creates `__base__<branch>` (COW snapshot of parent)
+  alongside the branch DB, inside the same write lock.
+- ✅ `vka branch` also saves a parent stats snapshot inside the lock
+  (`<branch_oid>_parent.json`) — used for stat-skip on the parent side
+  during diff (restored 3-way diff time from ~22 s to ~170 ms on a
+  4.76 GB DB).
+- ✅ `vka_databases` schema migration `vkarious_3.sql` adds `base_oid`
+  column linking a branch to its base snapshot.
+- ✅ Successful `vka diff --apply` auto-drops the base DB + parent
+  snapshot file.
 
-### Remaining (see `NEXT-STEPS.md`)
+### Done — CLI
 
-- ❌ CLI integration test for `vka branch` + `vka diff` (the actual
-  user-facing path; right now we only test the Python function).
-- ❌ No-PK 3-way fallback (currently skips no-PK tables in 3-way).
-- ❌ 2-way fallback with visible warning when a branch has no base.
+- ✅ `vka diff <branch>` uses 3-way when a base exists.
+- ✅ Preview mode (`vka diff` without `--apply`) always exits 0 — even
+  with conflicts. Conflicts and drifts are reported for the user to see.
+- ✅ `vka diff --apply` exits non-zero on any conflict; nothing is
+  applied to the parent.
+- ✅ When a branch has no base (legacy branch, or post-apply re-run):
+  - Prominent yellow/bold warning on stderr explaining the risk.
+  - `--apply` is refused unless `--allow-2way-apply` is passed.
+  - Recovery hint: drop and recreate the branch.
+
+### Done — tests (54 / 54 passing)
+
+| File | Tests | Coverage |
+|---|---:|---|
+| `tests/test_schema_3way.py` | 9 | unit-level 3-way merge matrix (no Postgres) |
+| `tests/test_page_diff.py`   | 24 | e2e for `cross_diff()` (2-way path; regression safety) |
+| `tests/test_page_diff_3way.py` | 12 | e2e for `cross_diff_3way()` — parent-drift, both-sides changes, conflicts, deletes |
+| `tests/test_cli_diff.py`    | 9 | full CLI path: `vka branch` + `vka diff` + `--apply` + exit codes + base lifecycle + 2-way fallback hardening |
+
+CLI test scenarios:
+
+- `no-changes` — empty diff, exit 0
+- `branch-adds-table-parent-untouched` — DDL + INSERTs, apply succeeds, base auto-dropped
+- `parent-drifts-branch-adds-table` — branch's table created, parent's reported as drift, NOT dropped
+- `column-changes-on-both-sides` — both `ADD COLUMN` survive; branch's UPDATE applied
+- `conflict-aborts-apply` — preview exits 0; `--apply` exits 1; parent untouched; base preserved
+- `no-base-warning-on-diff` — prominent stderr warning when base is missing
+- `no-base-refuses-apply` — `--apply` exits 1, parent untouched
+- `no-base-allow-2way-apply` — `--allow-2way-apply` flag bypasses refusal
+- `apply-then-rerun-falls-back` — base auto-dropped after apply; re-run shows fallback warning
+
+### Remaining
+
+- ❌ **No-PK 3-way support.** Currently `cross_diff_3way()` skips
+  tables without a primary key. 2-way has a multiset fallback;
+  3-way needs the same idea extended with base as a reference.
+  Design and scope: see `NEXT-STEPS.md` section 2.
+
+### Deferred (not needed for v1)
+
+- Three-way diff for views/functions at body-text level. Currently we
+  emit DROP+CREATE on any body difference; "both rewrote the same
+  function" appears as a conflict only if both versions differ.
+- Auto-rebase ("pull main's drift into the branch first, then diff").
+- Conflict resolution flags (`--ours` / `--theirs`).
+- A `vka rebranch <branch>` convenience command (today: drop + branch).

@@ -1528,7 +1528,7 @@ def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
         print(f"  files scanned:           {totals['scanned_files']}  "
               f"({totals['scanned_bytes']/1024/1024:.1f} MB)")
         print(f"  relations with changes:  {totals['rels_with_changes']}")
-        print(f"  DDL (pre)={totals['DDL_PRE']}  DDL (post)={totals['DDL_POST']}")
+        print(f"  DDL_PRE={totals['DDL_PRE']}  DDL_POST={totals['DDL_POST']}")
         print(f"  INSERT={totals['INSERT']}  UPDATE={totals['UPDATE']}  DELETE={totals['DELETE']}")
         if totals["rels_no_pk_skipped"]:
             print(f"  relations skipped (no PK): {totals['rels_no_pk_skipped']}")

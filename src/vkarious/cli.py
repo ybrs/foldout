@@ -316,7 +316,12 @@ def list_databases_cmd() -> None:
                    "(default: print SQL only).")
 @click.option("--sql-only", is_flag=True,
               help="Print only the SQL statements, no summary.")
-def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
+@click.option("--allow-2way-apply", is_flag=True,
+              help="Allow --apply when the branch has no merge base. "
+                   "USE WITH CAUTION: may propose DROPs for objects the "
+                   "parent added independently since the branch was created.")
+def diff(branch_name: str, apply: bool, sql_only: bool,
+         allow_2way_apply: bool) -> None:
     """Show row-level changes on BRANCH_NAME relative to its parent.
 
     Uses the page-diff snapshot taken at branch time to identify exactly
@@ -339,8 +344,22 @@ def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
             if base is not None:
                 click.echo(f"  base:     {base[1]} (3-way merge)")
             else:
-                click.echo(f"  base:     (none — falling back to 2-way diff)")
-                click.echo(f"            recreate this branch to enable 3-way diff.")
+                # Prominent warning on stderr — yellow/bold if TTY.
+                click.secho(
+                    "WARNING: no merge base for this branch — running 2-way diff",
+                    fg="yellow", bold=True, err=True,
+                )
+                click.secho(
+                    "  Without a merge base we cannot tell branch's intent apart\n"
+                    "  from parent's independent changes. The diff below may\n"
+                    "  propose DROPs for objects the parent added since this\n"
+                    "  branch was created.\n"
+                    f"  To enable 3-way merge, drop and recreate the branch:\n"
+                    f"     DROP DATABASE \"{branch_name}\";\n"
+                    f"     vka branch {parent_name} {branch_name}",
+                    fg="yellow", err=True,
+                )
+                click.echo(f"  base:     (none — 2-way diff)")
             click.echo(f"  snapshot: {snap_path}")
             click.echo(f"  pgdata:   {data_directory}")
             click.echo()
@@ -362,13 +381,33 @@ def diff(branch_name: str, apply: bool, sql_only: bool) -> None:
             for s in result["sql"]:
                 click.echo(s)
 
-        if result.get("conflicts"):
+        # In preview mode, conflicts are reported but we exit 0 — the user
+        # wants to SEE the conflicts. Only --apply refuses.
+        if apply and result.get("conflicts"):
             click.echo()
-            click.echo(f"{len(result['conflicts'])} conflict(s). Not applying.", err=True)
+            click.echo(
+                f"{len(result['conflicts'])} conflict(s). Not applying.",
+                err=True,
+            )
             raise click.ClickException(
                 "Merge conflict. Resolve the listed conflicts on the branch "
                 "and re-run `vka diff`."
             )
+
+        # Refuse --apply on a baseless branch unless explicitly authorized.
+        if apply and base is None and not allow_2way_apply:
+            click.secho(
+                "\nRefusing to apply a 2-way diff (branch has no merge base).",
+                fg="red", bold=True, err=True,
+            )
+            click.echo(
+                "  Without a base we cannot distinguish branch's changes from\n"
+                "  parent's independent drift. Applying could DROP things the\n"
+                "  parent added since this branch was created.\n"
+                "  If you understand the risks, re-run with --allow-2way-apply.",
+                err=True,
+            )
+            raise click.ClickException("Refused: missing merge base.")
 
         if apply and result["sql"]:
             click.echo()
