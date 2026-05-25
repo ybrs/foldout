@@ -277,7 +277,16 @@ intent: branch wants it gone, main was actively editing it).
 
 ### Row identity: PK and no-PK
 
-We strongly suggest always using a primary key on your tables. 
+We strongly suggest always using a primary key on your tables.
+
+Without a PK, foldout's row-level 3-way is **best-effort**: it matches
+rows by full content (multiset deltas), so a parallel UPDATE of the
+same row on both sides looks like *"both deleted the old version, then
+each side inserted its own new version"* — which the diff applies as
+two compatible inserts instead of flagging a CONFLICT. When this
+shape is detected (both sides have writes on the same pages of a
+no-PK table), foldout prints a warning. See `CTID-vs-PK.md` for why
+`ctid` can't simply fill in for a PK here.
 
 **Tables with a primary key** use the PK as row identity. foldout
 LSN-scans changed pages on BRANCH and MAIN, collects candidate PKs
