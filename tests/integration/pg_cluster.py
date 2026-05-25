@@ -38,7 +38,8 @@ def _pick_free_port() -> int:
 class PgCluster:
     """A running PostgreSQL instance, isolated to its own PGDATA + port."""
 
-    def __init__(self, binary: PgBinary, data_root: Path = DATA_ROOT) -> None:
+    def __init__(self, binary: PgBinary, data_root: Path = DATA_ROOT,
+                 extra_conf: dict[str, str] | None = None) -> None:
         self.binary = binary
         self.data_root = data_root
         self.data_root.mkdir(parents=True, exist_ok=True)
@@ -48,6 +49,7 @@ class PgCluster:
         self.log_file = self.pgdata.with_suffix(".log")
         self.port = _pick_free_port()
         self.superuser = "postgres"
+        self.extra_conf = dict(extra_conf) if extra_conf else {}
         self._running = False
 
     def initdb(self) -> None:
@@ -84,6 +86,8 @@ class PgCluster:
             fh.write("synchronous_commit = off\n")
             fh.write("shared_buffers = 64MB\n")
             fh.write("max_connections = 30\n")
+            for key, value in self.extra_conf.items():
+                fh.write(f"{key} = {value}\n")
 
     def start(self) -> None:
         if self._running:

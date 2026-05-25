@@ -163,30 +163,76 @@ def get_pg_major_version(conn) -> int:
         version_str = cur.fetchone()[0]
     return int(version_str.split('.')[0])
 
-def create_snapshot_database(source_database: str) -> tuple[str, int]:
-    """Create a new database for snapshot with timestamp name."""
+
+def get_file_copy_method(conn) -> str | None:
+    """Return the server's `file_copy_method` GUC, or None on PG < 18.
+
+    `file_copy_method` was introduced in PostgreSQL 18. When set to
+    `'clone'`, `CREATE DATABASE ... STRATEGY = FILE_COPY` uses kernel
+    reflink syscalls (FICLONE / copy_file_range on CoW filesystems) so
+    no userland copy step is needed.
+    """
+    if get_pg_major_version(conn) < 18:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("SHOW file_copy_method")
+        return cur.fetchone()[0].lower()
+
+
+def should_use_native_clone(conn) -> bool:
+    """True iff PG ≥ 18 is configured to clone files itself.
+
+    When True, `CREATE DATABASE ... STRATEGY = FILE_COPY` already produces
+    reflinked relation files; the manual `cp --reflink=always` step in
+    `copy_database_files()` is redundant and should be skipped.
+    """
+    return get_file_copy_method(conn) == "clone"
+
+def _create_database_sql(name: str, pg_version: int,
+                         template: str | None) -> str:
+    """Render the CREATE DATABASE SQL for our supported strategies.
+
+    - `template` set (PG 18+ native clone path): emits `TEMPLATE <src>` with
+      `STRATEGY=FILE_COPY` so PG itself clones the relation files. With
+      `file_copy_method=clone` on PG 18+ that becomes a reflink copy.
+    - `template` unset, PG >= 15: empty DB with `STRATEGY=FILE_COPY`. Caller
+      is expected to overwrite the files with `copy_database_files()`.
+    - PG < 15: plain `CREATE DATABASE` (no STRATEGY keyword).
+    """
+    if template is not None:
+        return (
+            f'CREATE DATABASE "{name}" '
+            f'TEMPLATE "{template}" STRATEGY=\'FILE_COPY\''
+        )
+    if pg_version < 15:
+        return f'CREATE DATABASE "{name}"'
+    return f'CREATE DATABASE "{name}" STRATEGY=\'FILE_COPY\''
+
+
+def create_snapshot_database(source_database: str,
+                             template: str | None = None) -> tuple[str, int]:
+    """Create a new database for snapshot with timestamp name.
+
+    Pass `template=source_database` (only safe on PG 18+ when no other
+    connections are open to the source) to let PG clone the source itself.
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     snapshot_name = f"snapshot_{source_database}_{timestamp}"
-    
+
     with connect() as conn:
         # Set autocommit for CREATE DATABASE (required for PostgreSQL)
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Create the new database
             pg_version = get_pg_major_version(conn)
-            if pg_version < 15:
-                cur.execute(f'''CREATE DATABASE "{snapshot_name}" ''')
-            else:
-                cur.execute(f'''CREATE DATABASE "{snapshot_name}" STRATEGY='FILE_COPY' ''')
-            
-            # Get the OID of the newly created database
+            cur.execute(_create_database_sql(snapshot_name, pg_version, template))
             cur.execute("SELECT oid FROM pg_database WHERE datname = %s", (snapshot_name,))
             oid = cur.fetchone()[0]
-            
+
     return snapshot_name, oid
 
 
-def create_base_database(source_database: str, branch_name: str) -> tuple[str, int]:
+def create_base_database(source_database: str, branch_name: str,
+                         template: str | None = None) -> tuple[str, int]:
     """Create a COW snapshot of source_database to serve as the merge base
     for `fld diff` of `branch_name`. Returned name is `__base__<branch_name>`.
     """
@@ -195,10 +241,7 @@ def create_base_database(source_database: str, branch_name: str) -> tuple[str, i
         conn.autocommit = True
         with conn.cursor() as cur:
             pg_version = get_pg_major_version(conn)
-            if pg_version < 15:
-                cur.execute(f'CREATE DATABASE "{base_name}" ')
-            else:
-                cur.execute(f'CREATE DATABASE "{base_name}" STRATEGY=\'FILE_COPY\' ')
+            cur.execute(_create_database_sql(base_name, pg_version, template))
             cur.execute("SELECT oid FROM pg_database WHERE datname = %s", (base_name,))
             oid = cur.fetchone()[0]
     return base_name, oid
@@ -275,26 +318,21 @@ def drop_base_for_branch(branch_name: str) -> str | None:
     return base_name
 
 
-def create_branch_database(source_database: str, branch_name: str) -> tuple[str, int]:
+def create_branch_database(source_database: str, branch_name: str,
+                           template: str | None = None) -> tuple[str, int]:
     """Create a new database for branch with user-provided branch name."""
-    # TODO: think. we might add a prefix, though git doesnt add any prefix. 
+    # TODO: think. we might add a prefix, though git doesnt add any prefix.
     branch_database_name = f"{branch_name}"
-    
+
     with connect() as conn:
         # Set autocommit for CREATE DATABASE (required for PostgreSQL)
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Create the new database
             pg_version = get_pg_major_version(conn)
-            if pg_version < 15:
-                cur.execute(f'''CREATE DATABASE "{branch_database_name}" ''')
-            else:
-                cur.execute(f'''CREATE DATABASE "{branch_database_name}" STRATEGY='FILE_COPY' ''')
-            
-            # Get the OID of the newly created database
+            cur.execute(_create_database_sql(branch_database_name, pg_version, template))
             cur.execute("SELECT oid FROM pg_database WHERE datname = %s", (branch_database_name,))
             oid = cur.fetchone()[0]
-            
+
     return branch_database_name, oid
 
 
@@ -461,22 +499,33 @@ def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> di
         # Prepare a unique backup directory name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = base_path / f"fld_delete_{source_oid}_{timestamp}"
-        
+
+        # Decide once whether to let PG clone the snapshot itself.
+        with connect() as conn:
+            use_native = should_use_native_clone(conn)
+
         # Safety: terminate connections and briefly lock during filesystem move
         terminate_database_connections(database_name)
         with database_write_lock(database_name):
             subprocess.run(["mv", str(source_path), str(backup_path)], check=True, capture_output=True, text=True)
 
-        # Drop and recreate the database to clear caches and allocate a new OID
+        # Drop and recreate the database. On PG 18+clone, we recreate it
+        # directly from the snapshot via TEMPLATE — PG handles the reflinks.
+        # On older PG / non-clone, we create empty then overlay with cp.
         drop_database(database_name)
-        create_database_with_strategy(database_name, "FILE_COPY")
+        if use_native:
+            create_database_with_strategy(database_name, "FILE_COPY",
+                                          template=snapshot_name)
+        else:
+            create_database_with_strategy(database_name, "FILE_COPY")
         restored_oid = get_database_oid(database_name)
 
         # Update the log with the new OID
         update_restore_log(log_id, "in_progress")
-        
-        # Copy from snapshot OID directory to the new database OID directory
-        copy_database_files(data_directory, snapshot_oid, restored_oid)
+
+        if not use_native:
+            # Copy from snapshot OID directory to the new database OID directory
+            copy_database_files(data_directory, snapshot_oid, restored_oid)
 
         # Post-restore validation: can connect and tables exist
         tables_count = 0
@@ -537,19 +586,27 @@ def create_database(database_name: str) -> None:
         with conn.cursor() as cur:
             cur.execute(f'CREATE DATABASE "{database_name}"')
 
-def create_database_with_strategy(database_name: str, strategy: str = "FILE_COPY") -> None:
+def create_database_with_strategy(database_name: str, strategy: str = "FILE_COPY",
+                                  template: str | None = None) -> None:
     """Create a database using a specific creation strategy.
 
     Mirrors the behavior used for snapshot creation (e.g., STRATEGY='FILE_COPY').
+    `template` enables the PG-native clone path (PG 18 + file_copy_method=clone);
+    if set, the new database is initialized from `template` instead of template1.
     """
     with connect() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
             pg_version = get_pg_major_version(conn)
-            if pg_version < 15:
-                cur.execute(f'''CREATE DATABASE "{database_name}" ''')
+            if template is not None:
+                cur.execute(
+                    f'CREATE DATABASE "{database_name}" '
+                    f'TEMPLATE "{template}" STRATEGY=\'{strategy}\''
+                )
+            elif pg_version < 15:
+                cur.execute(f'CREATE DATABASE "{database_name}"')
             else:
-                cur.execute(f'''CREATE DATABASE "{database_name}" STRATEGY='{strategy}' ''')
+                cur.execute(f'CREATE DATABASE "{database_name}" STRATEGY=\'{strategy}\'')
 
 
 def table_exists(table_name: str, database_name: str = "foldout") -> bool:
