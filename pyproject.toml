@@ -26,6 +26,9 @@ packages = ["src/foldout"]
 include = ["src/foldout"]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not integration'"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: end-to-end tests that download PostgreSQL binaries and run a real cluster (opt in with `-m integration`)",
+]

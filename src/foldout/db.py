@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import subprocess
 import time
@@ -311,9 +312,13 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
     if not target_path.exists():
         raise FileNotFoundError(f"Target database directory not found: {target_path}")
     
-    # Check FLD_NOCOW environment variable to determine copy method
+    # FLD_NOCOW forces a plain recursive copy (useful for non-CoW filesystems).
+    # FLD_COW_STRICT skips the fallback path so a missing reflink capability
+    # surfaces as an error rather than a silent slow copy — required for
+    # tests that need to prove the COW path was taken.
     use_nocow = os.getenv("FLD_NOCOW") is not None
-    
+    strict_cow = os.getenv("FLD_COW_STRICT") is not None
+
     subprocess.run(
         ["rm", "-rf", str(target_path) + "/"],
         check=True,
@@ -321,9 +326,20 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
         text=True
     )
 
-    # Use regular cp if FLD_NOCOW is set, otherwise use cp -c for copy-on-write
-    cp_args = ["cp", "-r" if use_nocow else "-cR", str(source_path) + "/", str(target_path) + "/"]
-    
+    # Pick the right cp flags per platform:
+    #   - macOS (Darwin): `cp -cR` uses clonefile() against APFS.
+    #   - Linux: `cp -R --reflink=always` uses FICLONE/FICLONERANGE against
+    #     a CoW filesystem (btrfs, xfs+reflink). `--reflink=always` fails
+    #     loudly if the FS doesn't support reflinks.
+    src_arg = str(source_path) + "/"
+    dst_arg = str(target_path) + "/"
+    if use_nocow:
+        cp_args = ["cp", "-r", src_arg, dst_arg]
+    elif platform.system() == "Darwin":
+        cp_args = ["cp", "-cR", src_arg, dst_arg]
+    else:
+        cp_args = ["cp", "-R", "--reflink=always", src_arg, dst_arg]
+
     try:
         subprocess.run(
             cp_args,
@@ -332,16 +348,16 @@ def copy_database_files(data_directory: str, source_oid: int, target_oid: int) -
             text=True
         )
     except subprocess.CalledProcessError:
-        if not use_nocow:
-            # Fallback to regular recursive copy if cp -c is not available
-            subprocess.run(
-                ["cp", "-r", str(source_path) + "/", str(target_path) + "/"],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-        else:
+        if use_nocow or strict_cow:
             raise
+        # Fallback to regular recursive copy if reflink isn't available
+        # (e.g. running on a non-CoW filesystem like overlay/tmpfs).
+        subprocess.run(
+            ["cp", "-r", src_arg, dst_arg],
+            check=True,
+            capture_output=True,
+            text=True
+        )
     
     # Remove pg_internal.init file from the copied directory
     pg_internal_init = target_path / "pg_internal.init"
@@ -792,22 +808,24 @@ def initialize_database() -> None:
     # Check if foldout database exists, create if not
     if not database_exists("foldout"):
         create_database("foldout")
-    
-    # Check if fld_dbversion table exists
+
+    migration_dir = Path(__file__).parent / "migration"
+
+    # Bootstrap on a brand-new install: foldout_1.sql creates fld_dbversion
+    # itself, so we must run it before get_current_version() can succeed.
     if not table_exists("fld_dbversion"):
-        # Run initial migration
-        migration_dir = Path(__file__).parent / "migration"
         initial_migration = migration_dir / "foldout_1.sql"
         if initial_migration.exists():
             execute_migration(initial_migration)
-        return
-    
-    # Check if we need to run additional migrations
+
+    # Apply every migration strictly newer than the recorded version. This
+    # path also catches fresh installs (they're at version 1 after the
+    # bootstrap above) so we don't need an early return that would leave
+    # later migrations unapplied.
     current_version = int(get_current_version())
     latest_version = get_latest_migration_version()
-    
+
     if current_version < latest_version:
-        migration_dir = Path(__file__).parent / "migration"
         for version in range(current_version + 1, latest_version + 1):
             migration_file = migration_dir / f"foldout_{version}.sql"
             if migration_file.exists():

@@ -37,22 +37,23 @@ PG_DUMP = os.environ.get("PG_DUMP", "/opt/homebrew/opt/postgresql@17/bin/pg_dump
 PSQL = os.environ.get("PSQL", "/opt/homebrew/opt/postgresql@17/bin/psql")
 
 
-def _server_pgdata():
-    for c in [
-        "/opt/homebrew/var/postgresql@17",
-        "/usr/local/var/postgresql@17",
-        "/usr/local/var/postgres",
-    ]:
-        if os.path.isdir(c) and os.path.exists(os.path.join(c, "PG_VERSION")):
-            return c
-    raise RuntimeError("could not locate PGDATA")
-
-
-PGDATA = _server_pgdata()
-
-
 def _dsn(db):
     return f"host={HOST} dbname={db} user={USER}"
+
+
+def _server_pgdata():
+    """Return the server's data directory.
+
+    Honors `FLD_PG_DATA_PATH` (for container-on-host setups). Otherwise
+    asks the running server via `SHOW data_directory`.
+    """
+    override = os.environ.get("FLD_PG_DATA_PATH")
+    if override:
+        return override
+    with psycopg.connect(_dsn("postgres")) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SHOW data_directory")
+            return cur.fetchone()[0]
 
 
 def _admin(sql):
@@ -130,7 +131,7 @@ class Scenario3way:
         self.expect_drift_kinds = expect_drift_kinds or []
         self.expect_converges = expect_converges
 
-    def run(self):
+    def run(self, pgdata):
         suf = uuid.uuid4().hex[:8]
         src = f"fld_3w_src_{suf}"
         base = f"fld_3w_base_{suf}"
@@ -154,10 +155,10 @@ class Scenario3way:
             if self.expect_converges:
                 _create(expected); _clone(src, expected); _checkpoint(expected)
 
-            page_diff.snapshot(PGDATA, tgt, snap)
+            page_diff.snapshot(pgdata, tgt, snap)
             # Also snapshot the parent (src) at the same instant — mirrors
             # what `vka branch` saves so 3-way can stat-skip on main side.
-            page_diff.snapshot(PGDATA, src, parent_snap)
+            page_diff.snapshot(pgdata, src, parent_snap)
 
             # Apply mutations
             _run(src, self.parent_mutate_sql)
@@ -170,7 +171,7 @@ class Scenario3way:
                 _checkpoint(expected)
 
             result = page_diff.cross_diff_3way(
-                PGDATA, src, tgt, base, snap,
+                pgdata, src, tgt, base, snap,
                 parent_snap_path=parent_snap,
                 verbose=False,
             )
@@ -418,11 +419,12 @@ SCENARIOS = [
 
 
 def main():
-    print(f"PGDATA: {PGDATA}")
+    pgdata = _server_pgdata()
+    print(f"PGDATA: {pgdata}")
     failures = 0
     for sc in SCENARIOS:
         try:
-            sc.run()
+            sc.run(pgdata)
         except AssertionError as e:
             failures += 1
             print(f"  FAIL  {sc.name}")
@@ -440,9 +442,18 @@ def main():
 try:
     import pytest
 
+    @pytest.fixture(scope="session")
+    def pgdata():
+        """Server data directory, looked up once per pytest session.
+
+        Lazy: only runs if a test actually requests it, so module collection
+        doesn't require a live PostgreSQL server.
+        """
+        return _server_pgdata()
+
     @pytest.mark.parametrize("scenario", SCENARIOS, ids=[s.name for s in SCENARIOS])
-    def test_3way_scenario(scenario):
-        scenario.run()
+    def test_3way_scenario(scenario, pgdata):
+        scenario.run(pgdata)
 except ImportError:
     pass
 
