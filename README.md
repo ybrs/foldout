@@ -36,8 +36,6 @@ Create a branch with a custom name:
 foldout branch database_name branch_name
 ```
 
-When `FLD_PG_DATA_PATH` is set, foldout uses that directory for physical file operations instead of querying `SHOW data_directory` from PostgreSQL.
-
 List snapshots:
 ```bash
 foldout snapshots list
@@ -82,7 +80,7 @@ At `foldout branch` time, foldout records a small snapshot file under
 - For every relation: `(relfilenode, segment_path, size, mtime_ns)`.
 
 At `foldout diff` time, we do two things on top of these snapshots —
-**both entirely read-only** on the parent and the branch.
+**read-only** on the parent and the branch.
 
 ### Schema (DDL) diff — catalog comparison
 We dump each side's relevant `pg_catalog` state (schemas, tables, columns,
@@ -93,7 +91,7 @@ the parent look like the branch:
 `CREATE INDEX`, `ADD CONSTRAINT`, `CREATE VIEW`, `CREATE OR REPLACE FUNCTION`,
 plus the matching `DROP …` and `setval(…)` statements where appropriate.
 
-### Row-level (DML) diff — page-LSN filtering
+### Row-level Data (DML) diff — page-LSN filtering
 Every 8 KB Postgres page has a header containing `pd_lsn` — the LSN of
 the WAL record that last wrote it. The diff uses three nested filters:
 
@@ -114,13 +112,13 @@ On a 4.76 GB database, a no-change diff takes ~2 ms; a typical diff
 
 ### Type-agnostic value handling
 Values are fetched cast to text (`col::text`) and emitted as
-`'<text>'::<typename>` SQL literals. Python never interprets Postgres
-values. This works for any type with normal text I/O — built-in types
-(`int`, `text`, `jsonb`, arrays, ranges), custom enums and domains,
-and extension types (e.g. PostGIS geometry). The diff code itself is
+`'<text>'::<typename>` SQL literals. This works for any type with normal text I/O — built-in types
+(`int`, `text`, `jsonb`, arrays, ranges), custom enums and domains, and extension types (e.g. PostGIS geometry). The diff code itself is
 type-free.
 
-## Three-way diff (what `foldout diff` actually does)
+Python never interprets Postgres values, so we don't need custom decoders (eg: for geoip etc) on the client/python side. 
+
+## Three-way diff (what `foldout diff` does behind the scenes)
 
 `foldout diff` compares **three** database states, not two:
 
@@ -278,6 +276,8 @@ UPDATE u SET v='branch-1' WHERE id=1;
 intent: branch wants it gone, main was actively editing it).
 
 ### Row identity: PK and no-PK
+
+We strongly suggest always using a primary key on your tables. 
 
 **Tables with a primary key** use the PK as row identity. foldout
 LSN-scans changed pages on BRANCH and MAIN, collects candidate PKs
