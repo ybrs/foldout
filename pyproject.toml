@@ -1,6 +1,6 @@
 [project]
 name = "foldout"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tool to get snapshots of PostgreSQL databases."
 authors = [{name = "Foldout Developers", email = "dev@example.com"}]
 readme = "README.md"
