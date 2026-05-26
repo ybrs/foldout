@@ -1,8 +1,18 @@
 # foldout
 
-foldout is a tool to create instant snapshots and branches of PostgreSQL databases in development workflows and for agentic development. 
+foldout brings git like semantics to postgresql. Create instant snapshots and branches of PostgreSQL databases in development workflows and for agentic development. See the 3-way diff and apply.
 
-Note: we are working on this. So there might be small changes. 
+## How
+
+We use filesystem's copy-on-write reflinks (btrfs, APFS, xfs+reflink) so a snapshot of a 100 GB DB is essentially free in time and disk. 
+
+We use a 3-way diff against a base, so if "main" moves further with data changes, we don't compare against current, we capture from branch time snapshot on "main", and branch time snapshot to current "branch" and combine. There is a very detail below.
+
+To diff a branch back against its parent, foldout records "page-index" at branch time — the WAL LSN plus per-relation (size, mtime, relfilenode) — and at diff time uses that as a three-stage filter (stat-skip unchanged files, then skip pages whose pd_lsn is at or below the recorded LSN, then materialize only the surviving rows for comparison), so diff cost scales with what changed on the branch, not the size of the database. 
+
+We also support 2-way diff, to see what are the changes between two databases.
+
+Note: we are actively working on this. So there might be small changes. 
 
 ## Tutorials
 
