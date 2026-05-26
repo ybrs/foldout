@@ -254,6 +254,85 @@ def test_apply_target_override(
     assert _row_count(cluster, SOURCE_DB, "items") == 3
 
 
+def _open_idle_branch_connection(cluster: PgCluster,
+                                 database: str) -> psycopg.Connection:
+    """Open + leave-idle a connection to `database` for delete-branch tests."""
+    return psycopg.connect(
+        cluster.dsn(database=database) + "?application_name=test-blocker"
+    )
+
+
+def test_delete_branch_refuses_when_branch_has_connections(
+    foldout_env: PgCluster,
+) -> None:
+    """No --force + a live connection on the branch → fail, nothing dropped."""
+    cluster = foldout_env
+    _seed_source(cluster)
+    runner = CliRunner()
+    _make_branch(runner)
+
+    blocker = _open_idle_branch_connection(cluster, BRANCH_DB)
+    try:
+        result = runner.invoke(cli, ["delete-branch", BRANCH_DB],
+                               catch_exceptions=False)
+        assert result.exit_code != 0, (
+            f"expected non-zero exit on active connection; output:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        combined = result.stdout + result.stderr
+        assert "active connection" in combined, combined
+        assert "test-blocker" in combined, combined
+        assert "--force" in combined, combined
+        assert "Nothing has been dropped" in combined, combined
+
+        # Crucially: BOTH databases must still exist. The old bug dropped
+        # the base before failing on the branch.
+        with psycopg.connect(cluster.dsn(database="postgres")) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM pg_database "
+                    "WHERE datname IN (%s, %s)", (BRANCH_DB, BASE_DB),
+                )
+                assert cur.fetchone()[0] == 2, (
+                    "delete-branch refusal must leave branch AND base intact"
+                )
+    finally:
+        blocker.close()
+
+
+def test_delete_branch_with_force_terminates_and_drops(
+    foldout_env: PgCluster,
+) -> None:
+    """--force kicks the connection and finishes the deletion cleanly."""
+    cluster = foldout_env
+    _seed_source(cluster)
+    runner = CliRunner()
+    _make_branch(runner)
+
+    blocker = _open_idle_branch_connection(cluster, BRANCH_DB)
+    try:
+        result = runner.invoke(cli, ["delete-branch", BRANCH_DB, "--force"],
+                               catch_exceptions=False)
+        assert result.exit_code == 0, (
+            f"delete-branch --force failed:\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+        # Both DBs gone, metadata clean.
+        with psycopg.connect(cluster.dsn(database="postgres")) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM pg_database "
+                    "WHERE datname IN (%s, %s)", (BRANCH_DB, BASE_DB),
+                )
+                assert cur.fetchone()[0] == 0
+    finally:
+        try:
+            blocker.close()
+        except Exception:
+            pass
+
+
 def test_delete_branch_removes_branch_base_and_page_index(
     foldout_env: PgCluster,
 ) -> None:

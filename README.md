@@ -4,6 +4,21 @@ foldout is a tool to create snapshots and branches of PostgreSQL databases.
 
 Important: This project is an active work-in-progress. Expect rapid changes, occasional instability, and breaking changes as features evolve. To get notified about updates, use the Watch button on the repository (choose "All Activity"). Manage your watch settings for this repo at: https://github.com/ybrs/foldout/subscription
 
+## Tutorials
+
+Two end-to-end walkthroughs of the snapshot → branch → diff → apply →
+delete-branch flow, built around a realistic data migration (adding a
+`loyalty_points` column to a shop database, with backfill from past orders):
+
+- [**Local PostgreSQL install**](docs/tutorial-local.md) — usual dev
+  workflow on a PG you've got running directly on your machine.
+- [**docker-compose setup**](docs/tutorial-docker.md) — PG runs in a
+  container, foldout runs on the host. Covers the `FLD_PG_DATA_PATH`
+  bind-mount wiring you need.
+
+Read one of these first if you're new to foldout. The rest of this
+README is reference material.
+
 ## Configuration
 
 Set the `FLD_DATABASE` environment variable to your PostgreSQL connection string:

@@ -22,11 +22,15 @@ def _elapsed(start: float) -> str:
 
 from . import __version__
 from .db import (
+    ActiveConnection,
     ActiveConnectionsTimeout,
     SourceHasActiveConnections,
     checkpoint,
     connect,
     copy_database_files,
+    get_active_connections,
+    terminate_database_connections,
+    wait_for_no_connections,
     create_base_database,
     create_branch_database,
     create_snapshot_database,
@@ -834,38 +838,92 @@ def apply(sql_file: str, target_override: str | None) -> None:
 
 @cli.command(name="delete-branch")
 @click.argument("branch_name")
-def delete_branch(branch_name: str) -> None:
+@click.option("--force", is_flag=True,
+              help="Terminate any active connections to the branch or its "
+                   "base before dropping. Without --force, delete-branch "
+                   "refuses if anything is connected — and importantly, "
+                   "performs NO destructive operation in that case (so the "
+                   "branch and base stay in a consistent state).")
+def delete_branch(branch_name: str, force: bool) -> None:
     """Drop a branch database, its merge base, and all foldout metadata.
 
-    Removes (in order):
-      1. The merge base DB (`__base__<branch>`) and its `fld_databases` row.
-      2. The branch DB and its `fld_databases` row.
-      3. Every `fld_page_index` row tied to the branch's OID.
+    Removes (in order, only after the safety check below has passed):
+      1. The branch DB.
+      2. The merge base DB (`__base__<branch>`) and its `fld_databases` row.
+      3. The branch's `fld_databases` row.
+      4. Every `fld_page_index` row tied to the branch's OID.
 
-    This is the explicit cleanup step after a successful `foldout apply`
-    — without it the branch DB lingers and the page-index stays in the
-    metadata table. No confirmation prompt; the command name is the
-    confirmation.
+    Safety: before doing anything destructive, we check `pg_stat_activity`
+    for backends connected to either the branch or its base. If any are
+    present and `--force` was not passed, we abort cleanly — nothing is
+    dropped, metadata stays intact, the user can retry once they close
+    the offending sessions. With `--force` we terminate them first.
     """
     try:
+        # Resolve everything from metadata before touching anything.
         branch_oid, parent_oid, parent_name = get_branch_parent(branch_name)
         base = get_branch_base(branch_name)
+        base_name = base[1] if base else None
 
-        # 1. Drop base if present.
-        if base is not None:
-            base_oid, base_name = base
-            if base_name:
-                drop_base_for_branch(branch_name)
-                click.echo(f"Dropped base snapshot '{base_name}'")
+        # Collect any active connections on BOTH databases up front so we
+        # can decide go/no-go atomically. The historical bug here was
+        # dropping the base first and then failing on the branch — that
+        # left a half-cleaned state. We now decide before touching disk.
+        active: list[ActiveConnection] = []
+        active.extend(get_active_connections(branch_name))
+        if base_name:
+            active.extend(get_active_connections(base_name))
 
-        # 2. Drop branch DB + remove its fld_databases row.
+        if active and not force:
+            click.secho(
+                f"\nERROR: cannot delete-branch '{branch_name}' — "
+                f"{len(active)} active connection(s) on the branch or its base.",
+                fg="red", bold=True, err=True,
+            )
+            click.echo(format_connection_table(active), err=True)
+            click.echo(
+                "\nClose them yourself, or re-run with --force to terminate them.\n"
+                "Nothing has been dropped.",
+                err=True,
+            )
+            raise click.ClickException(
+                f"refused: {len(active)} active connection(s) on branch/base"
+            )
+
+        if active:
+            # --force path: kick everyone off both DBs, then verify.
+            for db in (branch_name, base_name):
+                if not db:
+                    continue
+                terminate_database_connections(db)
+            for db in (branch_name, base_name):
+                if not db:
+                    continue
+                try:
+                    wait_for_no_connections(db, timeout_s=10.0)
+                except ActiveConnectionsTimeout as exc:
+                    _report_termination_timeout_and_exit(exc)
+            click.echo(
+                f"Terminated {len(active)} connection(s) "
+                f"on {branch_name}/{base_name or '(no base)'}"
+            )
+
+        # Drop branch DB first. If anything goes wrong here we haven't
+        # touched the base yet — recoverable.
         if database_exists(branch_name):
             drop_database(branch_name)
             click.echo(f"Dropped branch database '{branch_name}'")
+
+        # Drop base + clean its metadata row.
+        if base_name:
+            dropped = drop_base_for_branch(branch_name)
+            if dropped:
+                click.echo(f"Dropped base snapshot '{dropped}'")
+
+        # Clean up the branch's own metadata.
         delete_database_record(branch_name)
         click.echo(f"Removed '{branch_name}' from fld_databases")
 
-        # 3. Remove page-index rows.
         removed = delete_page_index_for_branch(branch_oid)
         if removed:
             click.echo(
