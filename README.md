@@ -13,11 +13,7 @@ delete-branch flow, built around a realistic data migration (adding a
 - [**Local PostgreSQL install**](docs/tutorial-local.md) — usual dev
   workflow on a PG you've got running directly on your machine.
 - [**docker-compose setup**](docs/tutorial-docker.md) — PG runs in a
-  container, foldout runs on the host. Covers the `FLD_PG_DATA_PATH`
-  bind-mount wiring you need.
-
-Read one of these first if you're new to foldout. The rest of this
-README is reference material.
+  container, foldout runs on the host. 
 
 ## Configuration
 
@@ -33,6 +29,21 @@ Optionally, set `FLD_PG_DATA_PATH` to override the detected PostgreSQL data dire
 # Example: host path where the container's PGDATA is mounted
 export FLD_PG_DATA_PATH="/Users/me/docker-volumes/postgres-data"
 ```
+
+## Install
+
+```
+  uv pip install foldout
+  # or
+  pip install foldout
+```
+
+Or you can run without install
+
+```
+  uvx --from foldout==0.1.0 foldout --help
+```
+
 
 ## Usage
 
@@ -112,12 +123,9 @@ explicitly:
 foldout delete-branch branch_name              # drops branch + base + metadata
 ```
 
-For registered branches, `foldout diff` is a true three-way merge
+For branches, `foldout diff` is a true three-way merge
 against the branch's frozen merge base (`__base__<branch>`) — it
-won't drop tables or rows the parent added independently. When no
-merge base exists, it falls back to 2-way with a yellow stderr
-warning. See **Three-way diff** below for the full decision matrix,
-conflict semantics, and limits.
+won't drop tables or rows the parent added independently. See **Three-way diff** below for the full decision matrix, conflict semantics, and limits.
 
 The two-argument form `foldout diff <left> <right>` works on any two
 databases — even ones with no shared history. It walks every page of
@@ -431,11 +439,15 @@ To recover full 3-way behavior after an apply, drop and rebranch.
 
 **Deliberately NOT handled in v1 (and why):**
 
+We try to go through the safest path.
+
 - **View / function bodies at "line-merge" granularity.** Bodies are
   compared whole. If both sides rewrote the same function: identical
   text → no-op, different text → CONFLICT. We don't try to 3-way
-  merge function source. *Why:* SQL/PLpgSQL line-merging is its own
-  product; for v1 the safe default is "you resolve it".
+  merge function source. *Why:* SQL/PLpgSQL for v1 the safe default is 
+  "you resolve it" then trying go through a line by line diff. You'll see the
+  views DDL but body changes will not. At least for now.
+
 - **No-PK tables with a branch-side `ADD COLUMN`.** The no-PK matcher
   uses full-row content as identity. Once the column count differs
   between BASE and BRANCH, `('a',)` and `('a', NULL)` look like
@@ -445,29 +457,28 @@ To recover full 3-way behavior after an apply, drop and rebranch.
   that table; the DDL still applies. *Workaround:* add a primary key
   (we strongly recommend one anyway), or pre-apply the column change
   to main before diffing.
+
 - **Auto-rebase.** foldout does not pull main's drift into the branch
   before diffing. If main has drifted heavily, conflicts may be
-  unavoidable. *Why:* rebase semantics are a separate feature and
-  belong in `vka rebase`, not silently inside `diff`.
+  unavoidable. *Why:*  We are not sure about the value of a replay 
+  or rebase. Simply on a development workflow, you'll write migrations. 
+  For other use cases a diff is enough. 
+
 - **`--ours` / `--theirs` overrides.** No global conflict-resolution
   flags. *Why:* in v1 we keep the failure mode loud and explicit; the
-  human resolves. We'll add these once we've seen real workflows that
-  actually want them.
+  human resolves. This is safer. Edit the sql file. Apply.
+
 - **Cross-tablespace tables.** Relations under custom tablespaces
-  (`pg_tblspc/`) aren't followed yet. *Why:* not in scope for v1;
-  uncommon in dev workflows.
+  (`pg_tblspc/`) aren't followed yet. *Why:* This is uncommon in dev 
+  workflows.
+
 - **Unlogged tables.** WAL-less writes don't bump `pd_lsn`
   predictably; diff would silently underreport. *Why:* by design,
   these tables aren't crash-safe — we don't try to merge them.
+
 - **Managed cloud Postgres** (RDS, Cloud SQL, etc.). The diff reads
   `PGDATA` files directly. The CLI must run on the same host as
   Postgres.
-
-**Why no partial apply on conflict?** v1 treats `foldout diff --apply`
-like `git merge` with no resolution strategy: it either applies
-cleanly or it applies nothing. A partial apply would silently mix
-"branch's wins" with "main's drifts" in non-obvious ways. If you need
-to ship a subset, resolve the conflicts in source first.
 
 ## `foldout diff` — requirements, limitations, portability
 
@@ -475,16 +486,19 @@ to ship a subset, resolve the conflicts in source first.
 - **CLI must run on the same host as PostgreSQL.** We read `PGDATA`
   files directly. This is a same-host dev tool — it won't work against
   managed cloud Postgres (RDS, Cloud SQL) where you can't see `PGDATA`.
-- **Read access to `PGDATA`.** Typically the Postgres OS user only.
+
 - **Permission to `CHECKPOINT`.** Superuser, or member of the
   `pg_checkpoint` role on PG15+. Used to flush dirty buffers to disk
   so committed writes are visible to file-level scanning.
 
 ### Soft assumptions (default settings work)
+
 - **`block_size = 8192`.** Default everywhere. Currently hardcoded;
   will be auto-detected later.
+
 - **`segment_size = 1 GB`.** Postgres compile-time setting; default
   everywhere. Same auto-detect plan.
+
 - **Default tablespace.** Relations are expected under
   `PGDATA/base/<dboid>/<relfilenode>`. Tables in a custom tablespace
   aren't currently followed via `pg_tblspc/`.
@@ -502,27 +516,12 @@ to ship a subset, resolve the conflicts in source first.
   through WAL on normal writes, so `pd_lsn` may be `0` / stale. Diff
   would silently underreport. Workaround: avoid unlogged tables in
   branched databases.
-- **Hot standby replicas** can't run `CHECKPOINT`.
 
 ### Background docs
 - `DATABASE-DIFF-TASK.md` — original design notes for `foldout diff`.
 - `3-WAY-DIFF-TASK.md` — three-way diff design, decision matrix, and
   implementation status.
 - `notes.md` — hashing benchmark numbers (alternative diff approach).
-
-# Example
-```
-export FLD_DATABASE="postgresql://@localhost:5432/postgres"
-(foldout) $ uv run foldout databases list
-OID        Database Name
-------------------------------
-14042      postgres
-4          template0
-1          template1
-65786      test
-```
-
-
 
 ## Development
 
