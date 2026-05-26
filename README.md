@@ -1,8 +1,8 @@
 # foldout
 
-foldout is a tool to create snapshots and branches of PostgreSQL databases.
+foldout is a tool to create instant snapshots and branches of PostgreSQL databases in development workflows and for agentic development. 
 
-Important: This project is an active work-in-progress. Expect rapid changes, occasional instability, and breaking changes as features evolve. To get notified about updates, use the Watch button on the repository (choose "All Activity"). Manage your watch settings for this repo at: https://github.com/ybrs/foldout/subscription
+Note: we are working on this. So there might be small changes. 
 
 ## Tutorials
 
