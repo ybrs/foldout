@@ -41,7 +41,7 @@ export FLD_PG_DATA_PATH="/Users/me/docker-volumes/postgres-data"
 Or you can run without install
 
 ```
-  uvx --from foldout==0.1.0 foldout --help
+  uvx --from foldout==0.1.1 foldout --help
 ```
 
 
