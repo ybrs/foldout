@@ -2,32 +2,43 @@
 Page-LSN database diff.
 
 Workflow:
-  page_diff_v2.py snapshot <pgdata> <dbname> <out.json>
+  build_page_index(pgdata, dbname) -> PageIndex
       Records (relfilenode, segments[(path, size, mtime_ns)]) per relation,
-      plus pg_current_wal_lsn() at snapshot time.
+      plus pg_current_wal_lsn() at capture time. The result is persisted
+      via `foldout.db.save_page_index()` so `foldout diff` can read it
+      back later.
 
-  page_diff_v2.py diff <pgdata> <dbname> <snap.json>
-      Phase 1: stat-skip relations whose files are byte-identical; for the
-               rest, mmap segments and find pages with pd_lsn > snap_lsn.
+  cross_diff(pgdata, source_db, current_db, index, ...)
+      Phase 1: stat-skip relations whose files are byte-identical to the
+               index; for the rest, mmap segments and find pages with
+               pd_lsn > index.lsn.
       Phase 2: parse line pointers on changed pages, classify each tuple
-               slot (live / dead-since-snapshot / unchanged), fetch live
+               slot (live / dead-since-capture / unchanged), fetch live
                tuple data via SELECT ... WHERE ctid = ANY (Postgres handles
                type and TOAST decoding for us).
 
+      When `index` is None, both phase-1 and phase-2 filters are disabled
+      — every page of `current_db` is a candidate. This is the slow path
+      used by the two-arg form `foldout diff A B` where the two databases
+      have no shared branch history.
+
 Output is per-relation:
-  - inserted / updated  : live tuples on changed pages with xmin > snap_xid
+  - inserted / updated  : live tuples on changed pages with xmin > index.xid
                            (we emit (ctid, row_data))
-  - deleted             : line pointers that became dead since snapshot
+  - deleted             : line pointers that became dead since the index
                            (we emit (ctid, parsed_pk_columns))
 """
 
-import json
+from __future__ import annotations
+
 import mmap
 import os
 import struct
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any
 
 import psycopg
 
@@ -788,33 +799,94 @@ def stat_segments(pgdata, relpath):
     return out
 
 
-def snapshot(pgdata, dbname, out_path):
-    dsn = f"host=127.0.0.1 dbname={dbname} user={os.environ.get('USER','aybarsb')}"
+@dataclass
+class PageIndex:
+    """File-stat + WAL-LSN capture of one database at one moment.
+
+    Used by `cross_diff` as a filter: a relation file whose current
+    `(size, mtime, relfilenode)` matches the index entry is unchanged
+    since capture and can be skipped wholesale. For files that did
+    change, pages with `pd_lsn <= index.lsn` are also skipped.
+
+    Persisted into the foldout metadata DB via
+    `foldout.db.save_page_index()` — see migration foldout_4.sql.
+    """
+
+    dbname: str
+    lsn: str  # text form, e.g. "0/1234ABC"
+    xid_snapshot: str
+    relations: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PageIndex":
+        """Build a PageIndex from a dict (e.g. JSONB column round-trip)."""
+        return cls(
+            dbname=data["dbname"],
+            lsn=data["lsn"],
+            xid_snapshot=data.get("xid_snapshot", ""),
+            relations=data.get("relations", []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Render the index as a plain dict (for JSONB storage)."""
+        return {
+            "dbname": self.dbname,
+            "lsn": self.lsn,
+            "xid_snapshot": self.xid_snapshot,
+            "relations": self.relations,
+        }
+
+
+def _open_dbname_connection(dbname: str) -> psycopg.Connection:
+    """Open a connection to `dbname` using FLD_DATABASE for everything else.
+
+    Imported lazily to avoid a circular import between page_diff and db.
+    """
+    from .db import get_database_dsn
+    params = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+    params["dbname"] = dbname
+    return psycopg.connect(psycopg.conninfo.make_conninfo(**params),
+                           autocommit=True)
+
+
+def build_page_index(pgdata: str, dbname: str) -> PageIndex:
+    """Capture a fresh page-index of `dbname` rooted at `pgdata`.
+
+    Runs CHECKPOINT first so the file mtime/size we capture reflect
+    committed state, not just what's in shared buffers. Reads
+    `pg_current_wal_lsn()` and the current xid snapshot for the LSN
+    filter and (eventually) tuple-level visibility checks.
+
+    The result has no persistence side effect — caller is expected to
+    save it via `foldout.db.save_page_index()`.
+    """
     t0 = time.perf_counter()
-    with psycopg.connect(dsn, autocommit=True) as conn:
+    with _open_dbname_connection(dbname) as conn:
         with conn.cursor() as cur:
-            # Force pending writes to disk so the file mtime/size we capture
-            # reflect committed state, not just what's in shared buffers.
             cur.execute("CHECKPOINT")
             cur.execute("SELECT pg_current_wal_lsn(), txid_current_snapshot();")
             lsn, xid_snap = cur.fetchone()
         rels = list_relations(conn)
-        snap = {
-            "dbname": dbname,
-            "lsn": lsn,
-            "xid_snapshot": str(xid_snap),
-            "relations": [],
-        }
+        relations: list[dict[str, Any]] = []
         for nsp, rel, oid, relfilenode, relpath in rels:
-            snap["relations"].append({
+            relations.append({
                 "schema": nsp, "name": rel, "oid": oid,
                 "relfilenode": relfilenode, "relpath": relpath,
                 "segments": stat_segments(pgdata, relpath),
             })
-    with open(out_path, "w") as f:
-        json.dump(snap, f, indent=2)
+    index = PageIndex(
+        dbname=dbname,
+        lsn=str(lsn),
+        xid_snapshot=str(xid_snap),
+        relations=relations,
+    )
     dt = (time.perf_counter() - t0) * 1000
-    print(f"snapshot: lsn={lsn}  relations={len(snap['relations'])}  {dt:.0f} ms  -> {out_path}")
+    print(
+        f"page-index: lsn={index.lsn}  relations={len(index.relations)}  "
+        f"{dt:.0f} ms",
+        file=sys.stderr,
+    )
+    return index
 
 
 # ---------- Phase 1 ----------
@@ -1209,14 +1281,33 @@ def live_ctids_for_block(pgdata, relpath, block):
     return out
 
 
-def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
-    with open(snap_path) as f:
-        snap = json.load(f)
-    snap_lsn = parse_lsn_str(snap["lsn"])
-    snap_by_oid = {r["oid"]: r for r in snap["relations"]}
+def cross_diff(pgdata, source_db, current_db,
+               index: "PageIndex | None", *, verbose=False):
+    """Compare `current_db` against `source_db` to produce a SQL diff.
+
+    Args:
+        index: A `PageIndex` captured at branch creation. When provided,
+            we use it to stat-skip unchanged files and LSN-filter pages.
+            Pass `None` to disable both filters — every page of
+            `current_db` becomes a candidate. The None path is slow
+            (O(size of current_db)) and is meant for ad-hoc two-DB diffs.
+    """
+    if index is None:
+        # Full-scan mode: pretend every relation is "missing from index"
+        # and the LSN threshold is zero (so every page qualifies).
+        snap_lsn = 0
+        snap_by_oid: dict[int, dict[str, Any]] = {}
+    else:
+        snap_lsn = parse_lsn_str(index.lsn)
+        snap_by_oid = {}
+        for relation in index.relations:
+            snap_by_oid[relation["oid"]] = relation
 
     def dsn(db):
-        return f"host=127.0.0.1 dbname={db} user={os.environ.get('USER','aybarsb')}"
+        from .db import get_database_dsn
+        params = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+        params["dbname"] = db
+        return psycopg.conninfo.make_conninfo(**params)
 
     t0 = time.perf_counter()
     totals = {"INSERT": 0, "UPDATE": 0, "DELETE": 0,
@@ -1268,17 +1359,30 @@ def cross_diff(pgdata, source_db, current_db, snap_path, *, verbose=False):
         src_relpath_by_name = {(r[0], r[1]): r[4] for r in src_rels}
 
         for nsp, rel, oid, current_relfilenode, current_relpath in cur_rels:
-            prev = snap_by_oid.get(oid)
-            if prev is None:
+            # TOAST tables (`pg_toast.pg_toast_<oid>`) are PG's internal
+            # storage for oversized values. User-visible diffs always
+            # express change at the OWNING table level — PG manages the
+            # corresponding TOAST rows automatically when the apply runs
+            # INSERT/UPDATE/DELETE on the owning table. Diff-loop logic
+            # below (get_pk_columns, fetch_rows_for_ctids) doesn't
+            # understand TOAST's (chunk_id, chunk_seq) shape, so skip.
+            if nsp == "pg_toast":
                 continue
-            if current_relfilenode != prev["relfilenode"]:
+
+            prev = snap_by_oid.get(oid)
+            # In indexed mode (index is not None): `prev is None` means the
+            # relation was created AFTER branch time — treat as fully new,
+            # scan every page. In full-scan mode (index is None): EVERY
+            # relation hits `prev is None` — same handling.
+            if prev is not None and current_relfilenode != prev["relfilenode"]:
                 print(f"  {nsp}.{rel}: REWRITTEN")
                 totals["rels_with_changes"] += 1
                 continue
 
+            prev_segments = prev["segments"] if prev is not None else []
             blocks, scanned_bytes, scanned_files, skipped_files = (
                 find_changed_blocks_per_relation(
-                    pgdata, current_relpath, prev["segments"], snap_lsn))
+                    pgdata, current_relpath, prev_segments, snap_lsn))
             totals["scanned_bytes"] += scanned_bytes
             totals["scanned_files"] += scanned_files
             totals["skipped_files"] += skipped_files
@@ -1557,10 +1661,18 @@ def _sql_text_literal(text_value, typename):
 
 # ---------- main ----------
 
-def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
-                     *, parent_snap_path=None, verbose=False):
+def cross_diff_3way(pgdata, source_db, current_db, base_db,
+                    index: "PageIndex | None",
+                    *, parent_index: "PageIndex | None" = None,
+                    verbose=False):
     """3-way diff. `base_db` is the COW snapshot of `source_db` at branch
     creation time; used as the merge base.
+
+    Args:
+        index: PageIndex of the branch at branch time. None disables
+            stat/LSN filtering on the branch side.
+        parent_index: PageIndex of the parent at branch time. None disables
+            stat/LSN filtering on the parent side.
 
     Returns a dict with the same keys as `cross_diff` plus:
       - "conflicts": list of dicts. Non-empty means abort the apply.
@@ -1569,21 +1681,25 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
     On conflict, no SQL is emitted for the conflicted parts; the caller
     should not apply.
     """
-    with open(snap_path) as f:
-        snap = json.load(f)
-    snap_lsn = parse_lsn_str(snap["lsn"])
-    snap_by_oid = {r["oid"]: r for r in snap["relations"]}
+    if index is None:
+        snap_lsn = 0
+        snap_by_oid: dict[int, dict[str, Any]] = {}
+    else:
+        snap_lsn = parse_lsn_str(index.lsn)
+        snap_by_oid = {}
+        for relation in index.relations:
+            snap_by_oid[relation["oid"]] = relation
 
-    # Parent (source) snapshot — used for stat-skip on main side so we
-    # don't have to LSN-scan every page of every relation on main.
-    parent_snap_by_oid = {}
-    if parent_snap_path:
-        with open(parent_snap_path) as f:
-            parent_snap = json.load(f)
-        parent_snap_by_oid = {r["oid"]: r for r in parent_snap["relations"]}
+    parent_snap_by_oid: dict[int, dict[str, Any]] = {}
+    if parent_index is not None:
+        for relation in parent_index.relations:
+            parent_snap_by_oid[relation["oid"]] = relation
 
     def dsn(db):
-        return f"host=127.0.0.1 dbname={db} user={os.environ.get('USER','aybarsb')}"
+        from .db import get_database_dsn
+        params = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+        params["dbname"] = db
+        return psycopg.conninfo.make_conninfo(**params)
 
     t0 = time.perf_counter()
     totals = {
@@ -1688,6 +1804,11 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
         base_relpath_by_name = {(r[0], r[1]): r[4] for r in base_rels}
 
         for nsp, rel, oid, current_relfilenode, current_relpath in cur_rels:
+            # TOAST tables are PG-internal storage for oversized values;
+            # see the matching comment in `cross_diff`.
+            if nsp == "pg_toast":
+                continue
+
             key = f"{nsp}.{rel}"
             if key not in base_schema["tables"]:
                 continue   # branch addition (handled above as new table)
@@ -1695,14 +1816,15 @@ def cross_diff_3way(pgdata, source_db, current_db, base_db, snap_path,
                 continue   # branch deleted; DDL_POST drops it on main
 
             prev = snap_by_oid.get(oid)
-            if prev is None:
-                continue
-            if current_relfilenode != prev["relfilenode"]:
+            if prev is not None and current_relfilenode != prev["relfilenode"]:
                 continue  # rare: rewrite on branch (VACUUM FULL etc.)
 
+            # prev is None (no index, or new-since-branch relation):
+            # scan all blocks of this relation.
+            prev_segments = prev["segments"] if prev is not None else []
             branch_blocks, b_bytes, b_files, b_skipped = (
                 find_changed_blocks_per_relation(
-                    pgdata, current_relpath, prev["segments"], snap_lsn
+                    pgdata, current_relpath, prev_segments, snap_lsn
                 )
             )
             totals["scanned_bytes"] += b_bytes

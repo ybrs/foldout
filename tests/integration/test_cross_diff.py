@@ -1,222 +1,189 @@
-"""
-End-to-end tests for page-LSN database diff (page_diff_v2.cross_diff).
+"""End-to-end tests for `page_diff.cross_diff` (2-way diff).
 
 Each scenario:
-  1. create SOURCE database, populate
-  2. clone to TARGET database (pg_dump | psql)
-  3. snapshot TARGET (records LSN + file stats)
-  4. mutate TARGET (inserts / updates / deletes / no-ops)
-  5. cross_diff(TARGET, SOURCE) -> SQL diff
-  6. apply SQL to SOURCE
-  7. assert SOURCE and TARGET are content-equal (per-table hash)
+  1. Create SOURCE db, run `setup_sql`
+  2. Clone SOURCE -> TARGET (CREATE DATABASE TEMPLATE)
+  3. build_page_index(TARGET)  — in-memory, no JSON files
+  4. Mutate TARGET (inserts / updates / deletes / DDL)
+  5. cross_diff(pgdata, SOURCE, TARGET, index)  -> SQL diff
+  6. Apply the SQL to SOURCE
+  7. Assert SOURCE and TARGET are content-equal (per-table md5 hash)
 
-Run directly:    python tests/test_page_diff.py
-Run via pytest:  pytest tests/test_page_diff.py -v
-
-The test assumes a local PostgreSQL 17 server reachable as the current user
-on 127.0.0.1. Set $PG_DUMP to override the pg_dump binary path.
+Runs against every cluster variant (pg16, pg17, pg18-default, pg18-clone)
+via the shared `pg_cluster` fixture. Scenarios are parametrized so each
+appears as its own pytest item.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import sys
 import uuid
-from pathlib import Path
+from typing import Any
 
 import psycopg
+import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-from foldout import page_diff as page_diff_v2  # noqa: E402
+from foldout import page_diff
 
-USER = os.environ.get("USER", "aybarsb")
-HOST = "127.0.0.1"
-PG_DUMP = os.environ.get("PG_DUMP", "/opt/homebrew/opt/postgresql@17/bin/pg_dump")
-PSQL = os.environ.get("PSQL", "/opt/homebrew/opt/postgresql@17/bin/psql")
+from .pg_cluster import PgCluster
 
 
-def _dsn(db):
-    return f"host={HOST} dbname={db} user={USER}"
-
-
-def _server_pgdata():
-    """Return the server's data directory.
-
-    Honors `FLD_PG_DATA_PATH` (for container-on-host setups where the
-    server's path differs from the host-visible path). Otherwise asks
-    the running server via `SHOW data_directory`.
-    """
-    override = os.environ.get("FLD_PG_DATA_PATH")
-    if override:
-        return override
-    with psycopg.connect(_dsn("postgres")) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SHOW data_directory")
-            return cur.fetchone()[0]
-
-
-def _admin_sql(sql):
-    """Run a SQL statement against the 'postgres' DB (for CREATE/DROP DATABASE)."""
-    with psycopg.connect(_dsn("postgres"), autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-
-
-def _exec(db, sql):
-    with psycopg.connect(_dsn(db), autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-
-
-def _exec_many(db, sqls):
-    with psycopg.connect(_dsn(db), autocommit=True) as conn:
-        with conn.cursor() as cur:
-            for s in sqls:
-                cur.execute(s)
-
-
-def _drop_db(name):
-    _admin_sql(f'DROP DATABASE IF EXISTS "{name}";')
-
-
-def _create_db(name):
-    _admin_sql(f'CREATE DATABASE "{name}";')
-
-
-def _clone_db(src, dst):
-    """Copy src -> dst via pg_dump | psql. Both DBs must exist; dst empty."""
-    if not os.path.exists(PG_DUMP):
-        raise RuntimeError(f"pg_dump not found at {PG_DUMP} (set $PG_DUMP)")
-    p1 = subprocess.Popen(
-        [PG_DUMP, "-h", HOST, "-U", USER, "-d", src],
-        stdout=subprocess.PIPE,
-    )
-    p2 = subprocess.Popen(
-        [PSQL, "-q", "-v", "ON_ERROR_STOP=1", _dsn(dst)],
-        stdin=p1.stdout,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    p1.stdout.close()
-    _, err = p2.communicate()
-    p1.wait()
-    if p2.returncode != 0:
-        raise RuntimeError(f"clone failed: {err.decode()[:500]}")
-
-
-def _checkpoint(db):
-    _exec(db, "CHECKPOINT")
-
-
-def _content_hash(db):
-    """Return a dict of {schema.table: md5_of_ordered_rows} for all user tables."""
-    out = {}
-    with psycopg.connect(_dsn(db)) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT n.nspname, c.relname
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind = 'r'
-                  AND n.nspname NOT IN ('pg_catalog','information_schema')
-                ORDER BY n.nspname, c.relname
-            """)
-            tables = cur.fetchall()
-        for nsp, rel in tables:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f'SELECT md5(coalesce(string_agg(row, \'|\' ORDER BY row), \'\')) '
-                    f'FROM (SELECT to_jsonb(x.*)::text AS row '
-                    f'      FROM "{nsp}"."{rel}" AS x) s'
-                )
-                (h,) = cur.fetchone()
-            out[f"{nsp}.{rel}"] = h
-    return out
-
-
-def _apply_sql(db, sql_statements):
-    with psycopg.connect(_dsn(db), autocommit=False) as conn:
-        with conn.cursor() as cur:
-            for s in sql_statements:
-                cur.execute(s)
-        conn.commit()
+pytestmark = pytest.mark.integration
 
 
 class Scenario:
-    """One end-to-end test case."""
+    """One end-to-end 2-way diff scenario."""
 
-    def __init__(self, name, setup_sql, mutate_sql, expected_counts=None,
-                 skip_post_checkpoint=False):
+    def __init__(self, name: str, setup_sql: list[str],
+                 mutate_sql: list[str],
+                 expected_counts: dict[str, int] | None = None,
+                 skip_post_checkpoint: bool = False) -> None:
+        """Build a scenario spec; nothing runs yet.
+
+        Args:
+            name: Short stable id used as the pytest parametrize id.
+            setup_sql: Statements to run on SOURCE before cloning.
+            mutate_sql: Statements to run on TARGET after cloning,
+                producing the diff we'll detect.
+            expected_counts: Optional `{INSERT|UPDATE|DELETE|DDL_PRE|DDL_POST: n}`.
+                Each present key is asserted against the totals reported
+                by cross_diff.
+            skip_post_checkpoint: If True, do NOT run CHECKPOINT after
+                mutate_sql. Used to catch regressions where the diff
+                forgets to flush dirty buffers itself.
+        """
         self.name = name
         self.setup_sql = setup_sql
         self.mutate_sql = mutate_sql
-        self.expected = expected_counts  # dict like {"INSERT": 2, ...} or None
+        self.expected = expected_counts
         self.skip_post_checkpoint = skip_post_checkpoint
 
-    def run(self, pgdata):
+
+class ScenarioRunner:
+    """Executes a Scenario against a live PgCluster."""
+
+    def __init__(self, cluster: PgCluster) -> None:
+        """Capture the cluster for all subsequent helper calls."""
+        self.cluster = cluster
+
+    def admin(self, sql: str) -> None:
+        """Run a maintenance SQL statement against the `postgres` DB."""
+        self.cluster.psql(sql, database="postgres")
+
+    def exec_many(self, db: str, statements: list[str]) -> None:
+        """Run multiple SQL statements against `db` in one connection."""
+        with psycopg.connect(self.cluster.dsn(database=db),
+                             autocommit=True) as conn:
+            with conn.cursor() as cur:
+                for stmt in statements:
+                    cur.execute(stmt)
+
+    def clone(self, src: str, dst: str) -> None:
+        """Make `dst` a copy of `src` using PG's CREATE DATABASE TEMPLATE.
+
+        Replaces the previous pg_dump | psql pipe. CREATE DATABASE
+        TEMPLATE requires no concurrent connections to src — fine here
+        because each helper opens and closes its own connection.
+        """
+        self.admin(f'CREATE DATABASE "{dst}" TEMPLATE "{src}"')
+
+    def checkpoint(self, db: str) -> None:
+        """Force pending writes on `db` to disk."""
+        self.cluster.psql("CHECKPOINT", database=db)
+
+    def content_hash(self, db: str) -> dict[str, str]:
+        """Return `{schema.table: md5_of_ordered_rows}` for all user tables.
+
+        Used as the post-merge equality check: after applying the diff
+        SQL to source, source and target must hash identically.
+        """
+        out: dict[str, str] = {}
+        with psycopg.connect(self.cluster.dsn(database=db)) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT n.nspname, c.relname
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind = 'r'
+                      AND n.nspname NOT IN ('pg_catalog','information_schema')
+                    ORDER BY n.nspname, c.relname
+                """)
+                tables = cur.fetchall()
+            for nsp, rel in tables:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f'SELECT md5(coalesce(string_agg(row, \'|\' '
+                        f'ORDER BY row), \'\')) '
+                        f'FROM (SELECT to_jsonb(x.*)::text AS row '
+                        f'      FROM "{nsp}"."{rel}" AS x) s'
+                    )
+                    (h,) = cur.fetchone()
+                out[f"{nsp}.{rel}"] = h
+        return out
+
+    def apply_sql(self, db: str, statements: list[str]) -> None:
+        """Run the diff's SQL statements against `db` in one transaction."""
+        with psycopg.connect(self.cluster.dsn(database=db),
+                             autocommit=False) as conn:
+            with conn.cursor() as cur:
+                for stmt in statements:
+                    cur.execute(stmt)
+            conn.commit()
+
+    def run(self, scenario: Scenario) -> None:
+        """Execute the scenario and assert correctness."""
         suffix = uuid.uuid4().hex[:8]
         src = f"fld_t_src_{suffix}"
         tgt = f"fld_t_tgt_{suffix}"
-        snap_path = f"/tmp/fld_t_{suffix}.json"
-        try:
-            _drop_db(src)
-            _drop_db(tgt)
-            _create_db(src)
-            _exec_many(src, self.setup_sql)
-            _checkpoint(src)
+        pgdata = str(self.cluster.pgdata)
 
-            _create_db(tgt)
-            _clone_db(src, tgt)
-            _checkpoint(tgt)
+        self.admin(f'CREATE DATABASE "{src}"')
+        self.exec_many(src, scenario.setup_sql)
+        self.checkpoint(src)
 
-            page_diff_v2.snapshot(pgdata, tgt, snap_path)
+        self.clone(src, tgt)
+        self.checkpoint(tgt)
 
-            _exec_many(tgt, self.mutate_sql)
-            if not getattr(self, "skip_post_checkpoint", False):
-                _checkpoint(tgt)
+        tgt_index = page_diff.build_page_index(pgdata, tgt)
 
-            result = page_diff_v2.cross_diff(pgdata, src, tgt, snap_path, verbose=False)
-            sql = result["sql"]
+        self.exec_many(tgt, scenario.mutate_sql)
+        if not scenario.skip_post_checkpoint:
+            self.checkpoint(tgt)
 
-            if self.expected is not None:
-                for k, v in self.expected.items():
-                    got = result.get(k, 0)
-                    assert got == v, (
-                        f"[{self.name}] expected {k}={v}, got {got}. "
-                        f"sql={sql}"
-                    )
+        result = page_diff.cross_diff(pgdata, src, tgt, tgt_index,
+                                      verbose=False)
+        sql = result["sql"]
 
-            if sql:
-                _apply_sql(src, sql)
+        if scenario.expected is not None:
+            for key, want in scenario.expected.items():
+                got = result.get(key, 0)
+                assert got == want, (
+                    f"[{scenario.name}] expected {key}={want}, got {got}. "
+                    f"sql={sql}"
+                )
 
-            h_src = _content_hash(src)
-            h_tgt = _content_hash(tgt)
-            assert h_src == h_tgt, (
-                f"[{self.name}] post-merge hash mismatch.\n"
-                f"  src={h_src}\n  tgt={h_tgt}\n  sql={sql}"
-            )
-            print(f"  PASS  {self.name}  "
-                  f"({len(sql)} stmts, {result['elapsed_ms']:.0f} ms)")
-        finally:
-            if os.path.exists(snap_path):
-                os.unlink(snap_path)
-            _drop_db(src)
-            _drop_db(tgt)
+        if sql:
+            self.apply_sql(src, sql)
+
+        h_src = self.content_hash(src)
+        h_tgt = self.content_hash(tgt)
+        assert h_src == h_tgt, (
+            f"[{scenario.name}] post-merge hash mismatch.\n"
+            f"  src={h_src}\n  tgt={h_tgt}\n  sql={sql}"
+        )
 
 
 # ----------------- scenarios -----------------
+# Verbatim port of the SCENARIOS list from tests/test_page_diff.py.
+# Adding / removing entries here drives the parametrized pytest matrix.
 
-SCENARIOS = [
+SCENARIOS: list[Scenario] = [
     Scenario(
         name="no-changes",
         setup_sql=[
             "CREATE TABLE u (id int primary key, name text)",
             "INSERT INTO u SELECT g, 'u-'||g FROM generate_series(1,500) g",
         ],
-        mutate_sql=[],  # do nothing on target
+        mutate_sql=[],
         expected_counts={"INSERT": 0, "UPDATE": 0, "DELETE": 0},
     ),
     Scenario(
@@ -316,7 +283,6 @@ SCENARIOS = [
             "INSERT INTO np SELECT 'r'||g, g FROM generate_series(1,50) g",
         ],
         mutate_sql=[
-            # UPDATE on no-PK table: shows up as INSERT(new) + DELETE(old)
             "UPDATE np SET v='CHANGED' WHERE n = 10",
         ],
         expected_counts={"INSERT": 1, "DELETE": 1, "UPDATE": 0},
@@ -328,9 +294,7 @@ SCENARIOS = [
             "INSERT INTO np VALUES ('dup',1),('dup',1),('dup',1),('uniq',2)",
         ],
         mutate_sql=[
-            # delete one of three 'dup' rows; should produce one DELETE
             "DELETE FROM np WHERE ctid = (SELECT ctid FROM np WHERE v='dup' LIMIT 1)",
-            # add a new duplicate
             "INSERT INTO np VALUES ('uniq',2)",
         ],
         expected_counts={"INSERT": 1, "DELETE": 1, "UPDATE": 0},
@@ -346,7 +310,7 @@ SCENARIOS = [
             "DELETE FROM u WHERE id = 50",
         ],
         expected_counts={"INSERT": 1, "UPDATE": 0, "DELETE": 1},
-        skip_post_checkpoint=True,  # critical: regression for forgotten flush
+        skip_post_checkpoint=True,
     ),
     # ---- DDL ----
     Scenario(
@@ -461,7 +425,6 @@ SCENARIOS = [
             "INSERT INTO log(msg) VALUES ('a'),('b')",
         ],
         mutate_sql=[
-            # Advance the sequence further on branch via more INSERTs.
             "INSERT INTO log(msg) VALUES ('c'),('d'),('e')",
         ],
         expected_counts={"INSERT": 3},
@@ -473,11 +436,9 @@ SCENARIOS = [
             "INSERT INTO u VALUES (1,'a'),(2,'b'),(3,'c')",
         ],
         mutate_sql=[
-            # jsonb default — Python couldn't sensibly parse this; Postgres can.
             "ALTER TABLE u ADD COLUMN meta jsonb NOT NULL DEFAULT '{\"v\":0}'::jsonb",
             "UPDATE u SET meta = '{\"v\":42}'::jsonb WHERE id = 2",
         ],
-        # Only id=2 should generate UPDATE; id=1 and id=3 keep the default
         expected_counts={"DDL_PRE": 1, "INSERT": 0, "UPDATE": 1, "DELETE": 0},
     ),
     Scenario(
@@ -498,9 +459,7 @@ SCENARIOS = [
         name="toasted-large-value",
         setup_sql=[
             "CREATE TABLE big (id int primary key, blob text)",
-            # < TOAST threshold, regular tuple
             "INSERT INTO big VALUES (1, repeat('a', 200))",
-            # > TOAST threshold (~2KB), forces TOAST
             "INSERT INTO big VALUES (2, repeat('b', 100000))",
         ],
         mutate_sql=[
@@ -512,55 +471,13 @@ SCENARIOS = [
 ]
 
 
-def main():
-    if not os.path.exists(PSQL):
-        print(f"FAIL: psql not found at {PSQL} (set $PSQL)")
-        sys.exit(1)
-    pgdata = _server_pgdata()
-    print(f"PGDATA: {pgdata}")
-    print(f"pg_dump: {PG_DUMP}")
-    failures = 0
-    for sc in SCENARIOS:
-        try:
-            sc.run(pgdata)
-        except AssertionError as e:
-            failures += 1
-            print(f"  FAIL  {sc.name}")
-            print(f"        {e}")
-        except Exception as e:
-            failures += 1
-            print(f"  ERROR {sc.name}: {type(e).__name__}: {e}")
-    print()
-    if failures:
-        print(f"{failures}/{len(SCENARIOS)} scenarios failed")
-        sys.exit(1)
-    print(f"all {len(SCENARIOS)} scenarios passed")
+def _scenario_id(scenario: Scenario) -> str:
+    """Render a pytest parametrize id from a Scenario object."""
+    return scenario.name
 
 
-# ---- pytest entry points (one parametrized test per scenario) ----
-
-try:
-    import pytest
-
-    @pytest.fixture(scope="session")
-    def pgdata():
-        """Server data directory, looked up once per pytest session.
-
-        Lazy: only runs if a test actually requests it, so module collection
-        doesn't require a live PostgreSQL server.
-        """
-        return _server_pgdata()
-
-    def _scenario_id(scenario):
-        """Render a pytest parametrize id from a Scenario object."""
-        return scenario.name
-
-    @pytest.mark.parametrize("scenario", SCENARIOS, ids=_scenario_id)
-    def test_scenario(scenario, pgdata):
-        scenario.run(pgdata)
-except ImportError:
-    pass
-
-
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=_scenario_id)
+def test_cross_diff_scenario(foldout_env: PgCluster, scenario: Scenario) -> None:
+    """Run one diff scenario end-to-end against the shared cluster."""
+    runner = ScenarioRunner(foldout_env)
+    runner.run(scenario)

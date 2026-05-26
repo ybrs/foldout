@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
+import time
 
 import click
+
+
+def _elapsed(start: float) -> str:
+    """Format `time.perf_counter() - start` as `(123 ms)` or `(1.23 s)`.
+
+    Used to tag CLI log lines with how long the preceding step took.
+    Keeps it consistent with `page_diff.build_page_index`'s own timing.
+    """
+    dt_ms = (time.perf_counter() - start) * 1000
+    if dt_ms < 1000:
+        return f"({dt_ms:.0f} ms)"
+    return f"({dt_ms / 1000:.2f} s)"
 
 from . import __version__
 from .db import (
     ActiveConnectionsTimeout,
     SourceHasActiveConnections,
+    checkpoint,
     connect,
     copy_database_files,
     create_base_database,
@@ -22,16 +37,16 @@ from .db import (
     format_connection_table,
     get_branch_base,
     get_branch_parent,
-    get_branch_parent_snapshot_path,
-    get_branch_snapshot_path,
     get_data_directory,
     get_database_oid,
     get_databases_with_snapshots,
     get_file_copy_method,
     get_pg_major_version,
     get_snapshot_record,
+    delete_page_index_for_branch,
     initialize_database,
     list_databases,
+    load_page_index,
     lock_source_database,
     log_branch_operation,
     register_base_database,
@@ -39,6 +54,7 @@ from .db import (
     register_snapshot_database,
     register_source_database,
     restore_database_from_snapshot,
+    save_page_index,
 )
 from .change_capture import ChangeCaptureInstaller
 from . import page_diff
@@ -135,6 +151,7 @@ def cli() -> None:
 def branch(database_name: str, branch_name: str, force: bool) -> None:
     """Create a branch of DATABASE_NAME with the given BRANCH_NAME."""
     try:
+        t_total = time.perf_counter()
         click.echo(f"Creating branch '{branch_name}' of database '{database_name}'...")
 
         # Get source database OID
@@ -158,57 +175,94 @@ def branch(database_name: str, branch_name: str, force: bool) -> None:
         data_directory = get_data_directory()
         click.echo(f"PostgreSQL data directory: {data_directory}")
 
-        # Take the source lock once for the whole branch operation. Both
-        # the native-clone and manual-cp paths run under it; the parent
-        # page-diff snapshot is recorded under the same lock so its
-        # (size, mtime) values match what was just cloned.
+        # Capture the parent's page-index BEFORE locking, while we can
+        # still connect to it. Once `lock_source_database` sets
+        # ALLOW_CONNECTIONS=false, no new sessions are allowed — including
+        # ours. The stat values may be a few µs stale relative to lock
+        # time, but cross_diff uses them as a "skip if unchanged" filter:
+        # mild staleness causes a few extra pages to be scanned (resolving
+        # to no-diff), never missed changes.
+        parent_index = page_diff.build_page_index(
+            data_directory, database_name
+        )
+
         try:
+            t_lock = time.perf_counter()
             with lock_source_database(database_name, force=force):
-                click.echo(f"Locked source database '{database_name}' for branch")
+                click.echo(
+                    f"Locked source database '{database_name}' for branch "
+                    f"{_elapsed(t_lock)}"
+                )
+                # Explicit CHECKPOINT under the lock so the file mtime/size
+                # we capture and the cp source bytes are committed state.
+                t = time.perf_counter()
+                checkpoint()
+                click.echo(f"CHECKPOINT {_elapsed(t)}")
+                # Both paths use STRATEGY=FILE_COPY (required — see the
+                # comment on _create_database_sql in db.py for why
+                # WAL_LOG silently corrupts the snapshot via stale
+                # shared_buffers). FILE_COPY forces TWO internal
+                # CHECKPOINTs per CREATE DATABASE; on busy clusters
+                # these dominate wall time.
                 if use_native_clone:
+                    t = time.perf_counter()
                     branch_database_name, target_oid = create_branch_database(
                         database_name, branch_name, template=database_name,
                     )
                     click.echo(
                         f"Created branch database '{branch_database_name}' "
-                        f"with OID: {target_oid}"
+                        f"with OID: {target_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
-
+                    t = time.perf_counter()
                     base_database_name, base_oid = create_base_database(
                         database_name, branch_name, template=database_name,
                     )
                     click.echo(
                         f"Created base snapshot '{base_database_name}' "
-                        f"with OID: {base_oid}"
+                        f"with OID: {base_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
-
                     click.echo("Branch and base files cloned by PostgreSQL (no manual copy)")
                 else:
+                    t = time.perf_counter()
                     branch_database_name, target_oid = create_branch_database(
                         database_name, branch_name
                     )
                     click.echo(
                         f"Created branch database '{branch_database_name}' "
-                        f"with OID: {target_oid}"
+                        f"with OID: {target_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
-
+                    t = time.perf_counter()
                     base_database_name, base_oid = create_base_database(
                         database_name, branch_name
                     )
                     click.echo(
                         f"Created base snapshot '{base_database_name}' "
-                        f"with OID: {base_oid}"
+                        f"with OID: {base_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
-
+                    t = time.perf_counter()
                     copy_database_files(data_directory, source_oid, target_oid)
-                    click.echo("Database files copied successfully")
-
+                    click.echo(f"Database files copied successfully {_elapsed(t)}")
+                    t = time.perf_counter()
                     copy_database_files(data_directory, source_oid, base_oid)
-                    click.echo("Base snapshot files copied successfully")
+                    click.echo(f"Base snapshot files copied successfully {_elapsed(t)}")
 
-                parent_snap_path = get_branch_parent_snapshot_path(target_oid)
-                page_diff.snapshot(data_directory, database_name, str(parent_snap_path))
-                click.echo(f"Saved parent snapshot: {parent_snap_path}")
+                # Branch DB is brand-new and not locked — capture its
+                # page-index now while we're still under the source lock
+                # (so source's state is guaranteed stable past this point).
+                t = time.perf_counter()
+                branch_index = page_diff.build_page_index(
+                    data_directory, branch_database_name
+                )
+                save_page_index(target_oid, "branch", branch_index)
+                save_page_index(target_oid, "parent", parent_index)
+                click.echo(
+                    f"Saved page-indexes for branch_oid={target_oid} "
+                    f"(parent + branch) {_elapsed(t)}"
+                )
         except SourceHasActiveConnections as exc:
             _report_active_connections_and_exit(exc)
         except ActiveConnectionsTimeout as exc:
@@ -232,13 +286,10 @@ def branch(database_name: str, branch_name: str, force: bool) -> None:
         log_branch_operation(source_oid, target_oid, branch_database_name)
         click.echo(f"Logged branch creation operation to fld_log")
 
-        # Take a page-diff snapshot of the branch so `fld diff <branch>`
-        # can later report row-level changes against the parent.
-        snap_path = get_branch_snapshot_path(target_oid)
-        page_diff.snapshot(data_directory, branch_database_name, str(snap_path))
-        click.echo(f"Saved page-diff snapshot: {snap_path}")
-
-        click.echo(f"Branch completed successfully: {branch_database_name}")
+        click.echo(
+            f"Branch completed successfully: {branch_database_name} "
+            f"{_elapsed(t_total)}"
+        )
 
     except click.ClickException:
         raise
@@ -256,6 +307,7 @@ def branch(database_name: str, branch_name: str, force: bool) -> None:
 def snapshot(database_name: str, force: bool) -> None:
     """Create a snapshot of DATABASE_NAME."""
     try:
+        t_total = time.perf_counter()
         click.echo(f"Creating snapshot of database '{database_name}'...")
 
         # Get source database OID
@@ -278,25 +330,42 @@ def snapshot(database_name: str, force: bool) -> None:
         # source, so the lock is useful even on the native-clone path —
         # and it gives us the same --force UX everywhere.
         try:
+            t_lock = time.perf_counter()
             with lock_source_database(database_name, force=force):
-                click.echo(f"Locked source database '{database_name}' for snapshot")
+                click.echo(
+                    f"Locked source database '{database_name}' for snapshot "
+                    f"{_elapsed(t_lock)}"
+                )
+                # Explicit CHECKPOINT under the lock — see branch() for
+                # the same rationale.
+                t = time.perf_counter()
+                checkpoint()
+                click.echo(f"CHECKPOINT {_elapsed(t)}")
+                # Both paths use STRATEGY=FILE_COPY (required — see
+                # _create_database_sql in db.py). FILE_COPY forces 2
+                # internal CHECKPOINTs per CREATE DATABASE.
                 if use_native_clone:
+                    t = time.perf_counter()
                     snapshot_name, target_oid = create_snapshot_database(
                         database_name, template=database_name,
                     )
                     click.echo(
                         f"Created snapshot database '{snapshot_name}' "
-                        f"with OID: {target_oid}"
+                        f"with OID: {target_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
                     click.echo("Database files cloned by PostgreSQL (no manual copy)")
                 else:
+                    t = time.perf_counter()
                     snapshot_name, target_oid = create_snapshot_database(database_name)
                     click.echo(
                         f"Created snapshot database '{snapshot_name}' "
-                        f"with OID: {target_oid}"
+                        f"with OID: {target_oid} {_elapsed(t)} "
+                        f"[FILE_COPY: 2 internal CHECKPOINTs]"
                     )
+                    t = time.perf_counter()
                     copy_database_files(data_directory, source_oid, target_oid)
-                    click.echo("Database files copied successfully")
+                    click.echo(f"Database files copied successfully {_elapsed(t)}")
         except SourceHasActiveConnections as exc:
             _report_active_connections_and_exit(exc)
         except ActiveConnectionsTimeout as exc:
@@ -306,7 +375,10 @@ def snapshot(database_name: str, force: bool) -> None:
         register_snapshot_database(snapshot_name, target_oid, source_oid)
         click.echo(f"Registered snapshot '{snapshot_name}' in fld_databases with parent OID {source_oid}")
 
-        click.echo(f"Snapshot completed successfully: {snapshot_name}")
+        click.echo(
+            f"Snapshot completed successfully: {snapshot_name} "
+            f"{_elapsed(t_total)}"
+        )
 
     except click.ClickException:
         raise
@@ -444,142 +516,367 @@ def list_databases_cmd() -> None:
         raise click.ClickException(str(e))
 
 
-@cli.command()
-@click.argument("branch_name")
-@click.option("--apply", is_flag=True,
-              help="Apply the generated SQL to the parent database "
-                   "(default: print SQL only).")
-@click.option("--sql-only", is_flag=True,
-              help="Print only the SQL statements, no summary.")
-@click.option("--allow-2way-apply", is_flag=True,
-              help="Allow --apply when the branch has no merge base. "
-                   "USE WITH CAUTION: may propose DROPs for objects the "
-                   "parent added independently since the branch was created.")
-def diff(branch_name: str, apply: bool, sql_only: bool,
-         allow_2way_apply: bool) -> None:
-    """Show row-level changes on BRANCH_NAME relative to its parent.
+_DIFF_HEADER_VERSION = 1
+_FULL_SCAN_WARN_BYTES = 100 * 1024 * 1024  # 100 MB
 
-    Uses the page-diff snapshot taken at branch time to identify exactly
-    which pages changed, then emits INSERT/UPDATE/DELETE SQL.
+
+def _database_exists_byname(name: str) -> bool:
+    """Return True if `name` exists as a registered foldout branch."""
+    try:
+        get_branch_parent(name)
+        return True
+    except Exception:
+        return False
+
+
+def _emit_sql_header(lines: list[str]) -> None:
+    """Print a `-- foldout-diff` header block on stdout (parsed by apply)."""
+    click.echo(f"-- foldout-diff v{_DIFF_HEADER_VERSION}")
+    for line in lines:
+        click.echo(f"-- {line}")
+    click.echo("--")
+
+
+def _emit_warnings(result: dict) -> None:
+    """Print any best-effort warnings from a diff result to stderr."""
+    for w in result.get("warnings") or []:
+        click.secho(
+            f"\nWARNING: {w['kind']} on {w['key']}",
+            fg="yellow", bold=True, err=True,
+        )
+        click.echo(f"  {w['note']}", err=True)
+
+
+def _emit_conflicts_to_stderr(result: dict) -> None:
+    """List conflicts on stderr if any. Doesn't raise — caller decides."""
+    conflicts = result.get("conflicts") or []
+    if not conflicts:
+        return
+    click.secho(
+        f"\n{len(conflicts)} conflict(s) — review before applying:",
+        fg="red", bold=True, err=True,
+    )
+    for conflict in conflicts:
+        click.echo(f"  - {conflict['kind']} {conflict.get('key', '')}",
+                   err=True)
+
+
+def _database_size_bytes(database_name: str) -> int:
+    """Return `pg_database_size(database_name)`. Reads via the postgres DB."""
+    import psycopg as _psycopg
+    from .db import get_database_dsn
+    params = _psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+    params["dbname"] = "postgres"
+    target_dsn = _psycopg.conninfo.make_conninfo(**params)
+    with _psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_database_size(%s)", (database_name,))
+            row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+@cli.command()
+@click.argument("left_name")
+@click.argument("right_name", required=False)
+def diff(left_name: str, right_name: str | None) -> None:
+    """Show row-level changes as a SQL diff (stdout) plus summary (stderr).
+
+    \b
+    Two forms:
+      foldout diff <branch_name>
+          Diffs the registered branch against its parent. Uses the stored
+          page-index for fast filtering. Falls back to 2-way diff if there
+          is no merge base.
+
+      foldout diff <left_db> <right_db>
+          Arbitrary two-database diff: walks every page of <left_db> and
+          compares against <right_db>. No registered relationship needed.
+          Slow on large DBs (O(<left_db> size)) — a warning is printed
+          to stderr if <left_db> exceeds ~100 MB.
+
+    SQL goes to stdout (so `foldout diff feature > diff.sql` Just Works).
+    Headers, summary, warnings, and conflicts go to stderr. Apply the
+    output with `foldout apply diff.sql`.
+    """
+    try:
+        if right_name is None:
+            _diff_registered_branch(left_name)
+        else:
+            _diff_arbitrary_pair(left_name, right_name)
+    except click.ClickException:
+        raise
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.ClickException(str(e))
+
+
+def _diff_registered_branch(branch_name: str) -> None:
+    """Diff a registered foldout branch against its parent (2-way or 3-way)."""
+    branch_oid, parent_oid, parent_name = get_branch_parent(branch_name)
+    data_directory = get_data_directory()
+    base = get_branch_base(branch_name)
+    branch_index = load_page_index(branch_oid, "branch")
+    if branch_index is None:
+        raise click.ClickException(
+            f"No page-index found for branch '{branch_name}' "
+            f"(branch_oid={branch_oid}). Re-create the branch with "
+            f"`foldout branch {parent_name} {branch_name}`."
+        )
+
+    mode = "3-way" if base is not None else "2-way"
+    click.echo(
+        f"Diffing branch '{branch_name}' against parent '{parent_name}' "
+        f"({mode})",
+        err=True,
+    )
+    if base is not None:
+        click.echo(f"  base:    {base[1]}", err=True)
+    else:
+        click.secho(
+            "WARNING: no merge base — running 2-way diff",
+            fg="yellow", bold=True, err=True,
+        )
+        click.echo(
+            "  Without a base we can't tell branch intent from parent\n"
+            "  drift. The SQL may propose DROPs for objects the parent\n"
+            "  added since this branch was created. Review before apply.",
+            err=True,
+        )
+    click.echo(f"  pgdata:  {data_directory}", err=True)
+    click.echo("", err=True)
+
+    if base is not None:
+        parent_index = load_page_index(branch_oid, "parent")
+        result = page_diff.cross_diff_3way(
+            data_directory, parent_name, branch_name, base[1],
+            branch_index, parent_index=parent_index, verbose=False,
+        )
+    else:
+        result = page_diff.cross_diff(
+            data_directory, parent_name, branch_name,
+            branch_index, verbose=False,
+        )
+
+    header_lines = [
+        f"parent: {parent_name}",
+        f"branch: {branch_name}",
+        f"mode: {mode}",
+    ]
+    if base is not None:
+        header_lines.append(f"base: {base[1]}")
+    _emit_sql_header(header_lines)
+    for stmt in result["sql"]:
+        click.echo(stmt)
+
+    _emit_warnings(result)
+    _emit_conflicts_to_stderr(result)
+
+    n_sql = len(result["sql"])
+    n_conf = len(result.get("conflicts") or [])
+    click.echo(
+        f"\n{n_sql} SQL statement(s), {n_conf} conflict(s), "
+        f"{result.get('elapsed_ms', 0):.0f} ms",
+        err=True,
+    )
+
+
+def _diff_arbitrary_pair(left_name: str, right_name: str) -> None:
+    """Diff two arbitrary databases — no registered relationship, no filter."""
+    data_directory = get_data_directory()
+    left_size = _database_size_bytes(left_name)
+
+    click.echo(
+        f"Diffing '{left_name}' against '{right_name}' "
+        f"(full scan — no shared branch history)",
+        err=True,
+    )
+    if left_size > _FULL_SCAN_WARN_BYTES:
+        click.secho(
+            f"WARNING: '{left_name}' is {left_size / (1024 * 1024):.1f} MB — "
+            f"full scan will read every page. This can take a while.",
+            fg="yellow", bold=True, err=True,
+        )
+    click.echo(f"  pgdata: {data_directory}", err=True)
+    click.echo("", err=True)
+
+    # No index → full scan: every page of `left_name` is a candidate.
+    result = page_diff.cross_diff(
+        data_directory, right_name, left_name, None, verbose=False,
+    )
+
+    header_lines = [
+        f"parent: {right_name}",
+        f"branch: {left_name}",
+        "mode: full-scan",
+    ]
+    _emit_sql_header(header_lines)
+    for stmt in result["sql"]:
+        click.echo(stmt)
+
+    _emit_warnings(result)
+    _emit_conflicts_to_stderr(result)
+
+    n_sql = len(result["sql"])
+    n_conf = len(result.get("conflicts") or [])
+    click.echo(
+        f"\n{n_sql} SQL statement(s), {n_conf} conflict(s), "
+        f"{result.get('elapsed_ms', 0):.0f} ms",
+        err=True,
+    )
+
+
+_DIFF_HEADER_FIELD_RE = re.compile(
+    r"^--\s+(?P<key>[a-z][a-z0-9_-]*):\s*(?P<value>.+?)\s*$"
+)
+
+
+def _parse_diff_header(text: str) -> dict[str, str]:
+    """Extract `-- foldout-diff` header key/value lines from a diff file.
+
+    Reads `--` comment lines at the top of the file up to the first
+    non-comment line; pulls out simple `key: value` pairs (parent, branch,
+    mode, base). Returns an empty dict if no `-- foldout-diff vN` marker
+    appears in the first 50 lines — caller decides whether that's fatal.
+    """
+    fields: dict[str, str] = {}
+    found_marker = False
+    for index, line in enumerate(text.splitlines()):
+        if index > 50:
+            break
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("--"):
+            break
+        if stripped.lower().startswith("-- foldout-diff"):
+            found_marker = True
+            continue
+        match = _DIFF_HEADER_FIELD_RE.match(stripped)
+        if match:
+            fields[match.group("key")] = match.group("value")
+    if not found_marker:
+        return {}
+    return fields
+
+
+@cli.command()
+@click.argument("sql_file", type=click.Path(exists=True, dir_okay=False,
+                                             readable=True))
+@click.option("--target", "target_override", default=None,
+              help="Override the target database from the diff header.")
+def apply(sql_file: str, target_override: str | None) -> None:
+    """Apply a SQL diff (produced by `foldout diff`) to its target database.
+
+    The target DB is taken from the `-- parent: <name>` header line that
+    `foldout diff` writes at the top of its output. Pass `--target <db>`
+    to override (useful when applying to a sibling DB or a freshly-named
+    parent).
+
+    This command is pure: it runs the SQL and nothing else. It does NOT
+    drop the branch, the merge base, or any page-index rows. Use
+    `foldout delete-branch <name>` to clean up after a successful merge.
+    """
+    try:
+        with open(sql_file, "r", encoding="utf-8") as fh:
+            text = fh.read()
+
+        header = _parse_diff_header(text)
+        if not header and target_override is None:
+            raise click.ClickException(
+                f"{sql_file}: no `-- foldout-diff vN` header found, and "
+                f"no --target was given. Either re-generate the file with "
+                f"`foldout diff` or pass --target <db>."
+            )
+
+        target = target_override or header.get("parent")
+        if not target:
+            raise click.ClickException(
+                f"{sql_file}: header missing `-- parent: <db>` and no "
+                f"--target supplied. Don't know where to apply."
+            )
+
+        if header.get("mode"):
+            click.echo(
+                f"apply: {sql_file} -> '{target}' "
+                f"(mode={header['mode']})",
+                err=True,
+            )
+        else:
+            click.echo(f"apply: {sql_file} -> '{target}'", err=True)
+
+        import psycopg
+        from .db import get_database_dsn
+        params = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
+        params["dbname"] = target
+        target_dsn = psycopg.conninfo.make_conninfo(**params)
+
+        executed = 0
+        with psycopg.connect(target_dsn) as conn:
+            with conn.cursor() as cur:
+                # psycopg accepts a single execute() with multiple
+                # statements; the whole file runs in one transaction so
+                # an error rolls back everything.
+                cur.execute(text)
+                executed = cur.rowcount  # rowcount of the last statement
+            conn.commit()
+
+        click.echo(
+            f"Applied {sql_file} successfully (last statement affected "
+            f"{executed} row(s)). Use `foldout delete-branch` to clean up.",
+            err=True,
+        )
+    except click.ClickException:
+        raise
+    except Exception as e:
+        click.echo(f"Error applying {sql_file}: {e}", err=True)
+        raise click.ClickException(str(e))
+
+
+@cli.command(name="delete-branch")
+@click.argument("branch_name")
+def delete_branch(branch_name: str) -> None:
+    """Drop a branch database, its merge base, and all foldout metadata.
+
+    Removes (in order):
+      1. The merge base DB (`__base__<branch>`) and its `fld_databases` row.
+      2. The branch DB and its `fld_databases` row.
+      3. Every `fld_page_index` row tied to the branch's OID.
+
+    This is the explicit cleanup step after a successful `foldout apply`
+    — without it the branch DB lingers and the page-index stays in the
+    metadata table. No confirmation prompt; the command name is the
+    confirmation.
     """
     try:
         branch_oid, parent_oid, parent_name = get_branch_parent(branch_name)
-        snap_path = get_branch_snapshot_path(branch_oid)
-        if not snap_path.exists():
-            raise click.ClickException(
-                f"No page-diff snapshot for branch '{branch_name}' at {snap_path}. "
-                f"It must have been created by `vka branch` after this feature was added."
-            )
-
-        data_directory = get_data_directory()
         base = get_branch_base(branch_name)
 
-        if not sql_only:
-            click.echo(f"Diffing branch '{branch_name}' against parent '{parent_name}'")
-            if base is not None:
-                click.echo(f"  base:     {base[1]} (3-way merge)")
-            else:
-                # Prominent warning on stderr — yellow/bold if TTY.
-                click.secho(
-                    "WARNING: no merge base for this branch — running 2-way diff",
-                    fg="yellow", bold=True, err=True,
-                )
-                click.secho(
-                    "  Without a merge base we cannot tell branch's intent apart\n"
-                    "  from parent's independent changes. The diff below may\n"
-                    "  propose DROPs for objects the parent added since this\n"
-                    "  branch was created.\n"
-                    f"  To enable 3-way merge, drop and recreate the branch:\n"
-                    f"     DROP DATABASE \"{branch_name}\";\n"
-                    f"     vka branch {parent_name} {branch_name}",
-                    fg="yellow", err=True,
-                )
-                click.echo(f"  base:     (none — 2-way diff)")
-            click.echo(f"  snapshot: {snap_path}")
-            click.echo(f"  pgdata:   {data_directory}")
-            click.echo()
-
+        # 1. Drop base if present.
         if base is not None:
-            parent_snap_path = get_branch_parent_snapshot_path(branch_oid)
-            result = page_diff.cross_diff_3way(
-                data_directory, parent_name, branch_name, base[1], str(snap_path),
-                parent_snap_path=str(parent_snap_path) if parent_snap_path.exists() else None,
-                verbose=not sql_only,
-            )
-        else:
-            result = page_diff.cross_diff(
-                data_directory, parent_name, branch_name, str(snap_path),
-                verbose=not sql_only,
-            )
+            base_oid, base_name = base
+            if base_name:
+                drop_base_for_branch(branch_name)
+                click.echo(f"Dropped base snapshot '{base_name}'")
 
-        if sql_only:
-            for s in result["sql"]:
-                click.echo(s)
+        # 2. Drop branch DB + remove its fld_databases row.
+        if database_exists(branch_name):
+            drop_database(branch_name)
+            click.echo(f"Dropped branch database '{branch_name}'")
+        delete_database_record(branch_name)
+        click.echo(f"Removed '{branch_name}' from fld_databases")
 
-        # Best-effort warnings (e.g. no-PK table with parallel writes on
-        # both sides). Not a conflict — diff still runs — but the user
-        # should know the result may be ambiguous.
-        for w in result.get("warnings") or []:
-            click.secho(
-                f"\nWARNING: {w['kind']} on {w['key']}",
-                fg="yellow", bold=True, err=True,
-            )
-            click.echo(f"  {w['note']}", err=True)
-
-        # In preview mode, conflicts are reported but we exit 0 — the user
-        # wants to SEE the conflicts. Only --apply refuses.
-        if apply and result.get("conflicts"):
-            click.echo()
+        # 3. Remove page-index rows.
+        removed = delete_page_index_for_branch(branch_oid)
+        if removed:
             click.echo(
-                f"{len(result['conflicts'])} conflict(s). Not applying.",
-                err=True,
-            )
-            raise click.ClickException(
-                "Merge conflict. Resolve the listed conflicts on the branch "
-                "and re-run `fld diff`."
+                f"Removed {removed} page-index row(s) for branch_oid={branch_oid}"
             )
 
-        # Refuse --apply on a baseless branch unless explicitly authorized.
-        if apply and base is None and not allow_2way_apply:
-            click.secho(
-                "\nRefusing to apply a 2-way diff (branch has no merge base).",
-                fg="red", bold=True, err=True,
-            )
-            click.echo(
-                "  Without a base we cannot distinguish branch's changes from\n"
-                "  parent's independent drift. Applying could DROP things the\n"
-                "  parent added since this branch was created.\n"
-                "  If you understand the risks, re-run with --allow-2way-apply.",
-                err=True,
-            )
-            raise click.ClickException("Refused: missing merge base.")
-
-        if apply and result["sql"]:
-            click.echo()
-            click.echo(f"Applying {len(result['sql'])} statements to '{parent_name}'...")
-            import psycopg
-            from .db import get_database_dsn
-            dsn = psycopg.conninfo.conninfo_to_dict(get_database_dsn())
-            dsn["dbname"] = parent_name
-            target_dsn = psycopg.conninfo.make_conninfo(**dsn)
-            with psycopg.connect(target_dsn) as conn:
-                with conn.cursor() as cur:
-                    for s in result["sql"]:
-                        cur.execute(s)
-                conn.commit()
-            click.echo("Applied. Parent now contains branch's data changes.")
-
-            # On successful apply, the base snapshot is no longer needed.
-            dropped = drop_base_for_branch(branch_name)
-            if dropped:
-                click.echo(f"Dropped base snapshot '{dropped}'.")
-            # Parent stats snapshot also no longer needed.
-            parent_snap_path = get_branch_parent_snapshot_path(branch_oid)
-            if parent_snap_path.exists():
-                parent_snap_path.unlink()
-
+        click.echo(f"delete-branch '{branch_name}' complete")
+    except click.ClickException:
+        raise
     except Exception as e:
-        click.echo(f"Error: {e}", err=True)
+        click.echo(f"Error deleting branch '{branch_name}': {e}", err=True)
         raise click.ClickException(str(e))
 
 

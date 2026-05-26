@@ -99,22 +99,96 @@ def get_branch_parent(branch_name: str) -> tuple[int, int, str]:
             return row[0], row[1], row[2]
 
 
-def get_snapshot_dir() -> Path:
-    """Directory where page-diff snapshots for branches live."""
-    base = Path(os.path.expanduser("~/.foldout/snapshots"))
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+def save_page_index(branch_oid: int, kind: str, index) -> None:
+    """Persist a `PageIndex` row in `fld_page_index` (upsert).
 
-
-def get_branch_snapshot_path(branch_oid: int) -> Path:
-    return get_snapshot_dir() / f"{branch_oid}.json"
-
-
-def get_branch_parent_snapshot_path(branch_oid: int) -> Path:
-    """Snapshot of the parent's file state at branch creation time.
-    Used by 3-way diff to stat-skip files where the parent hasn't drifted.
+    Args:
+        branch_oid: OID of the branch (or the source DB for a "parent" kind).
+        kind: 'branch' or 'parent'. See foldout_4.sql for the semantics.
+        index: A `foldout.page_diff.PageIndex` instance.
     """
-    return get_snapshot_dir() / f"{branch_oid}_parent.json"
+    if kind not in ("branch", "parent"):
+        raise ValueError(f"unknown page-index kind: {kind!r}")
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params["dbname"] = "foldout"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    # Local import to avoid the page_diff → db → page_diff cycle.
+    from psycopg.types.json import Jsonb
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fld_page_index
+                  (branch_oid, kind, dbname, lsn, xid_snapshot, relations)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (branch_oid, kind) DO UPDATE SET
+                  dbname       = EXCLUDED.dbname,
+                  lsn          = EXCLUDED.lsn,
+                  xid_snapshot = EXCLUDED.xid_snapshot,
+                  captured_at  = now(),
+                  relations    = EXCLUDED.relations
+                """,
+                (
+                    branch_oid, kind, index.dbname, index.lsn,
+                    index.xid_snapshot, Jsonb(index.relations),
+                ),
+            )
+        conn.commit()
+
+
+def load_page_index(branch_oid: int, kind: str):
+    """Load a previously-saved `PageIndex`, or return None if missing.
+
+    Returns:
+        A `foldout.page_diff.PageIndex`, or `None` if no row exists for
+        `(branch_oid, kind)`.
+    """
+    if kind not in ("branch", "parent"):
+        raise ValueError(f"unknown page-index kind: {kind!r}")
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params["dbname"] = "foldout"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT dbname, lsn, xid_snapshot, relations "
+                "FROM fld_page_index WHERE branch_oid = %s AND kind = %s",
+                (branch_oid, kind),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    # Local import to avoid the page_diff → db → page_diff cycle.
+    from .page_diff import PageIndex
+    return PageIndex(
+        dbname=row[0],
+        lsn=row[1],
+        xid_snapshot=row[2] or "",
+        relations=row[3] or [],
+    )
+
+
+def delete_page_index_for_branch(branch_oid: int) -> int:
+    """Remove every `fld_page_index` row for a branch.
+
+    Called by `foldout delete-branch`. Returns the number of rows
+    deleted (0..2 — one for `branch`, one for `parent`).
+    """
+    db_dsn = get_database_dsn()
+    conn_params = psycopg.conninfo.conninfo_to_dict(db_dsn)
+    conn_params["dbname"] = "foldout"
+    target_dsn = psycopg.conninfo.make_conninfo(**conn_params)
+    with psycopg.connect(target_dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM fld_page_index WHERE branch_oid = %s",
+                (branch_oid,),
+            )
+            removed = cur.rowcount
+        conn.commit()
+    return removed
 
 
 def terminate_database_connections(database_name: str) -> int:
@@ -279,6 +353,21 @@ def alter_database_allow_connections(database_name: str, allow: bool) -> None:
             cur.execute(sql)
 
 
+def checkpoint() -> None:
+    """Issue a cluster-wide `CHECKPOINT`.
+
+    Flushes every dirty 8 KB page in shared_buffers to its on-disk
+    relation file, plus a few WAL records to mark the consistent point.
+    Cluster-wide — doesn't matter which DB we're connected to.
+
+    Used before a snapshot/branch so the file mtime/size we capture, and
+    the data the subsequent reflink copy reads, reflect committed state.
+    """
+    with _connect_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CHECKPOINT")
+
+
 def wait_for_no_connections(database_name: str,
                             timeout_s: float = 10.0,
                             poll_interval_s: float = 0.1) -> None:
@@ -337,12 +426,10 @@ def lock_source_database(database_name: str,
             )
             terminate_database_connections(database_name)
             wait_for_no_connections(database_name, timeout_s=wait_timeout_s)
-        # CHECKPOINT flushes dirty buffers to PGDATA files. Cluster-wide,
-        # so it doesn't need to run on the locked DB itself.
-        with _connect_postgres_db() as conn:
-            with conn.cursor() as cur:
-                logger.debug("CHECKPOINT before snapshot of %s", database_name)
-                cur.execute("CHECKPOINT")
+        # NOTE: CHECKPOINT is the caller's responsibility — see
+        # `foldout.db.checkpoint()`. Hoisting it out keeps lock concerns
+        # (allow_connections + terminate) separate from buffer flushing,
+        # and lets the CLI layer print timing info around it.
         yield
     finally:
         alter_database_allow_connections(database_name, allow=True)
@@ -389,12 +476,29 @@ def _create_database_sql(name: str, pg_version: int,
                          template: str | None) -> str:
     """Render the CREATE DATABASE SQL for our supported strategies.
 
-    - `template` set (PG 18+ native clone path): emits `TEMPLATE <src>` with
-      `STRATEGY=FILE_COPY` so PG itself clones the relation files. With
-      `file_copy_method=clone` on PG 18+ that becomes a reflink copy.
-    - `template` unset, PG >= 15: empty DB with `STRATEGY=FILE_COPY`. Caller
-      is expected to overwrite the files with `copy_database_files()`.
-    - PG < 15: plain `CREATE DATABASE` (no STRATEGY keyword).
+    Why we always force `STRATEGY=FILE_COPY` (even though WAL_LOG is the
+    PG 15+ default and would be faster on idle clusters):
+
+    `WAL_LOG` populates the new database's pages by going through
+    shared_buffers — every page gets a dirty buffer entry keyed by
+    `(new_oid, relfilenode)`. When our caller subsequently runs
+    `copy_database_files()` (rm -rf + cp --reflink the on-disk dir),
+    the disk has source's content but shared_buffers still serves the
+    stale empty-template1 pages for the new OID. First query on the
+    snapshot returns "relation X does not exist" because pg_class is
+    read from cache.
+
+    `FILE_COPY` doesn't have this problem: PG uses direct `copy_dir()`
+    syscalls and never populates shared_buffers for the new OID. The
+    cost is two internal `CHECKPOINT_IMMEDIATE`s (slow on busy clusters)
+    — that's the price for correctness on the manual-cp path.
+
+    On PG 18 with `file_copy_method=clone` + `TEMPLATE source`, the byte
+    copy inside FILE_COPY becomes a kernel FICLONE; reflinks happen
+    inside PG and we skip `copy_database_files()` entirely.
+
+    PG < 15: WAL_LOG didn't exist; plain CREATE DATABASE is FILE_COPY
+    by default and we don't need the keyword.
     """
     if template is not None:
         return (
@@ -735,10 +839,10 @@ def restore_database_from_snapshot(database_name: str, snapshot_name: str) -> di
         # On older PG / non-clone, we create empty then overlay with cp.
         drop_database(database_name)
         if use_native:
-            create_database_with_strategy(database_name, "FILE_COPY",
+            create_database_with_strategy(database_name,
                                           template=snapshot_name)
         else:
-            create_database_with_strategy(database_name, "FILE_COPY")
+            create_database_with_strategy(database_name)
         restored_oid = get_database_oid(database_name)
 
         # Update the log with the new OID
@@ -807,27 +911,20 @@ def create_database(database_name: str) -> None:
         with conn.cursor() as cur:
             cur.execute(f'CREATE DATABASE "{database_name}"')
 
-def create_database_with_strategy(database_name: str, strategy: str = "FILE_COPY",
+def create_database_with_strategy(database_name: str,
                                   template: str | None = None) -> None:
-    """Create a database using a specific creation strategy.
+    """Create a database, optionally cloning from `template`.
 
-    Mirrors the behavior used for snapshot creation (e.g., STRATEGY='FILE_COPY').
-    `template` enables the PG-native clone path (PG 18 + file_copy_method=clone);
-    if set, the new database is initialized from `template` instead of template1.
+    Used by the restore path. Same dispatch rule as `_create_database_sql`:
+    `template` set → STRATEGY=FILE_COPY (PG-native clone, fast on PG 18 +
+    file_copy_method=clone); otherwise plain CREATE DATABASE (defaults to
+    WAL_LOG on PG 15+, single allowed option pre-15).
     """
     with connect() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
             pg_version = get_pg_major_version(conn)
-            if template is not None:
-                cur.execute(
-                    f'CREATE DATABASE "{database_name}" '
-                    f'TEMPLATE "{template}" STRATEGY=\'{strategy}\''
-                )
-            elif pg_version < 15:
-                cur.execute(f'CREATE DATABASE "{database_name}"')
-            else:
-                cur.execute(f'CREATE DATABASE "{database_name}" STRATEGY=\'{strategy}\'')
+            cur.execute(_create_database_sql(database_name, pg_version, template))
 
 
 def table_exists(table_name: str, database_name: str = "foldout") -> bool:

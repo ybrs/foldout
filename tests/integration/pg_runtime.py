@@ -94,6 +94,11 @@ class PgBinary:
         """Path to the `psql` client binary."""
         return self.bin_dir / "psql"
 
+    @property
+    def pg_dump(self) -> Path:
+        """Path to the `pg_dump` binary (used for full-DB clone in tests)."""
+        return self.bin_dir / "pg_dump"
+
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Return an environment dict with PATH/LD_LIBRARY_PATH wired up."""
         base = dict(os.environ)

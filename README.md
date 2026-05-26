@@ -29,12 +29,20 @@ foldout databases list
 Create a snapshot:
 ```bash
 foldout snapshot database_name
+foldout snapshot database_name --force   # also kicks any active connections
 ```
 
 Create a branch with a custom name:
 ```bash
 foldout branch database_name branch_name
+foldout branch database_name branch_name --force   # kicks active connections
 ```
+
+> Both `snapshot` and `branch` lock the source database
+> (`ALLOW_CONNECTIONS = false`) for the duration. If any connection is
+> active, foldout refuses by default and lists the offending pid /
+> app / state / query. Re-run with `--force` to terminate them. See
+> `TASKS.md` for the rare crash-recovery case.
 
 List snapshots:
 ```bash
@@ -65,29 +73,58 @@ foldout version
 
 Show what changed on a branch (relative to its parent):
 ```bash
-foldout diff branch_name                       # preview: SQL + conflicts + drift summary
-foldout diff branch_name --sql-only            # print just the SQL (script-friendly)
-foldout diff branch_name --apply               # run the SQL against the parent
-foldout diff branch_name --apply --allow-2way-apply
-                                               # opt-in apply for branches without
-                                               # a merge base (see "Three-way diff")
+foldout diff branch_name > diff.sql            # SQL on stdout, progress on stderr
+foldout diff prod staging > prod-vs-staging.sql  # ad-hoc two-DB diff (slow on large DBs)
 ```
 
-`foldout diff` is a true three-way merge against the branch's frozen
-merge base (`__base__<branch>`) — it won't drop tables or rows the
-parent added independently. See **Three-way diff** below for the full
-decision matrix, conflict semantics, and limits.
+`foldout diff` is **read-only**. It writes a parseable SQL diff with a
+`-- foldout-diff vN` header to stdout, plus progress and any conflicts
+to stderr. The header records the parent / branch / mode so
+`foldout apply` knows where to send the SQL. Review or hand-edit the
+file, then apply it:
+
+```bash
+$EDITOR diff.sql
+foldout apply diff.sql                         # runs the SQL against the parent
+foldout apply diff.sql --target other_db       # override the parent
+```
+
+Apply has no side effects beyond running the SQL — it does not drop the
+branch or its merge base. When you're done with the branch, clean up
+explicitly:
+
+```bash
+foldout delete-branch branch_name              # drops branch + base + metadata
+```
+
+For registered branches, `foldout diff` is a true three-way merge
+against the branch's frozen merge base (`__base__<branch>`) — it
+won't drop tables or rows the parent added independently. When no
+merge base exists, it falls back to 2-way with a yellow stderr
+warning. See **Three-way diff** below for the full decision matrix,
+conflict semantics, and limits.
+
+The two-argument form `foldout diff <left> <right>` works on any two
+databases — even ones with no shared history. It walks every page of
+`<left>`, so cost is O(left DB size). A warning is printed for
+databases over ~100 MB.
 
 ## How `foldout diff` works
 
-At `foldout branch` time, foldout records a small snapshot file under
-`~/.foldout/snapshots/<branch_oid>.json` capturing:
+At `foldout branch` time, foldout writes a small **page-index** into
+the `fld_page_index` table of the `foldout` metadata database, with
+one row per `(branch_oid, kind)` where `kind` is `'branch'` or
+`'parent'`. Each row captures:
 
 - The WAL LSN at the moment of branching.
 - For every relation: `(relfilenode, segment_path, size, mtime_ns)`.
 
-At `foldout diff` time, we do two things on top of these snapshots —
-**read-only** on the parent and the branch.
+(Prior to v0.2 this was a JSON file at
+`~/.foldout/snapshots/<branch_oid>.json`. See `CHANGELOG.md` for the
+migration.)
+
+At `foldout diff` time, we do two things on top of these page-indexes
+— **read-only** on the parent and the branch.
 
 ### Schema (DDL) diff — catalog comparison
 We dump each side's relevant `pg_catalog` state (schemas, tables, columns,
